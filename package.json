@@ -1,0 +1,17 @@
+{
+  "name": "zhihuishu-userscript",
+  "version": "1.0.0",
+  "description": "学习通与智慧树共享课 Tampermonkey 合并适配脚本",
+  "main": "xuexitong-zhihuishu.user.js",
+  "scripts": {
+    "test": "node --test adapter.test.cjs vision.test.cjs",
+    "check": "node --check xuexitong-zhihuishu.user.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "devDependencies": {
+    "jsdom": "^30.1.3"
+  }
+}

@@ -1,0 +1,28 @@
+# 默认忽略所有文件，仅发布经过检查的项目文件。
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/package.json
+!/package-lock.json
+!/adapter.test.cjs
+!/vision.test.cjs
+!/xuexitong-zhihuishu.user.js
+!/验证结果.md
+!/dist/
+/dist/*
+!/dist/xuexitong-zhihuishu.user.js
+!/dist/安装说明.txt
+!/dist/验证结果.md
+!/dist/LICENSE
+!/dist/SHA256.txt
+
+# 密钥、浏览器数据、截图、个人配置和本机开发记录均不进入仓库。
+**/.env*
+**/*credentials*
+**/*cookies*
+**/*session*
+**/*.log
+**/*.har
+**/*.pem
+**/*.key
