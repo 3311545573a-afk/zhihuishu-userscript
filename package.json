@@ -1,7 +1,7 @@
 {
   "name": "zhihuishu-userscript",
-  "version": "1.0.0",
-  "description": "学习通与智慧树共享课 Tampermonkey 合并适配脚本",
+  "version": "1.2.2",
+  "description": "学习通与智慧树共享课、智慧树作业考试 Tampermonkey 合并适配脚本",
   "main": "xuexitong-zhihuishu.user.js",
   "scripts": {
     "test": "node --test adapter.test.cjs vision.test.cjs",

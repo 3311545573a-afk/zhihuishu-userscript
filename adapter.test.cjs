@@ -265,11 +265,13 @@ test('空课程页面保持等待，出现视频后自动发现', async () => {
     } finally { b.close(); }
 });
 
-test('不把智慧树考试页或无关域名分流到共享课自动化', async () => {
+test('智慧树考试页分流到作业/考试自动化，不使用共享课播放器', async () => {
     const b = browser(course, { url: 'https://studyvideoh5.zhihuishu.com/exam' });
     try {
         await b.flush();
-        assert.equal(b.control.app, null);
+        assert.ok(b.control.app, '考试页应由作业/考试适配器接管');
+        assert.equal(b.control.app._stepTitle, '作业/考试');
+        assert.equal(b.control.app._videoEl, undefined, '不能把考试页交给视频适配器');
     } finally { b.close(); }
 });
 
@@ -786,12 +788,27 @@ test('无效答案和限流响应保持暂停且不作答', async () => {
     }
 });
 
-test('智慧树将旧设置2x和3x限制到1.8x', async () => {
-    for (const rate of [2, 3]) {
+test('智慧树将超过页面上限的已保存倍速限制到1.8x', async () => {
+    for (const rate of [1.8, 2, 2.5, 3]) {
         const b = browser(course, { settings: { rate } });
         try { await b.flush(); assert.equal(b.video.playbackRate, 1.8); assert.equal(b.video.defaultPlaybackRate, 1.8); }
         finally { b.close(); }
     }
+});
+
+test('智慧树迁移并保存超过1.8x的旧设置', async () => {
+    const saved = [];
+    const b = browser(course, { settings: { rate: 4 }, setup(w) {
+        w.GM_setValue = (key, value) => saved.push([key, value]);
+    } });
+    try {
+        await b.flush();
+        const select = b.w.document.querySelector('#xt-ds-host').shadowRoot.querySelector('#rate');
+        assert.equal(select.value, '1.8');
+        assert.equal(b.video.playbackRate, 1.8);
+        assert.equal(b.video.defaultPlaybackRate, 1.8);
+        assert.ok(saved.some(([key, value]) => key === 'rate' && value === 1.8));
+    } finally { b.close(); }
 });
 
 test('只有#app深层子组件持有课程数据时仍可找到并切节', async () => {
@@ -964,7 +981,87 @@ test('智慧树倍速面板禁用超过1.8x的选项', async () => {
         await b.flush();
         const select = b.w.document.querySelector('#xt-ds-host').shadowRoot.querySelector('#rate');
         assert.equal(select.value, '1.8');
-        for (const option of select.options) if (Number(option.value) > 1.8) assert.equal(option.disabled, true);
+        for (const rate of [1.8, 2, 2.5, 3]) {
+            const option = select.querySelector(`option[value="${rate}"]`);
+            assert.ok(option);
+            assert.equal(option.disabled, rate > 1.8);
+        }
+    } finally { b.close(); }
+});
+
+test('智慧树面板拒绝超过1.8x的设置并将上限沿用到后续视频', async () => {
+    const saved = [];
+    const b = browser(course, { setup(w) {
+        w.GM_setValue = (key, value) => saved.push([key, value]);
+    } });
+    try {
+        await b.flush();
+        const select = b.w.document.querySelector('#xt-ds-host').shadowRoot.querySelector('#rate');
+        select.value = '3';
+        select.dispatchEvent(new b.w.Event('change'));
+        await b.flush();
+        assert.equal(select.value, '1.8');
+        assert.ok(saved.some(([key, value]) => key === 'rate' && value === 1.8));
+        assert.equal(b.video.playbackRate, 1.8);
+        assert.equal(b.video.defaultPlaybackRate, 1.8);
+
+        const next = b.w.document.createElement('video');
+        next.id = b.video.id;
+        next.src = 'next.mp4';
+        next.play = async () => {};
+        next.pause = () => {};
+        b.video.replaceWith(next);
+        await b.tick();
+        assert.equal(next.playbackRate, 1.8);
+        assert.equal(next.defaultPlaybackRate, 1.8);
+    } finally { b.close(); }
+});
+
+const scriptWarning = '<div class="el-message-box__wrapper"><div role="dialog">检测到异常脚本，为保证您的正常学习进度，请您关闭插件后，回到学堂重新进入视频学习页正常学习</div></div>';
+
+test('异常脚本提示使自动化彻底停止并释放倍速控制，不自动重启', async () => {
+    const saved = [];
+    const b = browser(course, { settings: { rate: 1.8, lockRate: true }, setup(w) {
+        w.GM_setValue = (key, value) => saved.push([key, value]);
+    } });
+    try {
+        await b.flush();
+        const app = b.control.app;
+        assert.equal(b.video.__xtRateLockInstalled, true);
+        b.w.document.body.insertAdjacentHTML('beforeend', scriptWarning);
+        await b.tick();
+        assert.equal(b.control.app, null);
+        assert.equal(app._destroyed, true);
+        assert.equal(app._timer, null);
+        assert.equal(b.media.paused, true);
+        assert.equal(b.video.__xtRateLockInstalled, false);
+        assert.equal(Object.getOwnPropertyDescriptor(b.video, 'playbackRate'), undefined);
+        assert.equal(b.video.playbackRate, 1);
+        assert.equal(b.video.defaultPlaybackRate, 1);
+        assert.ok(saved.some(([key, value]) => key === 'rate' && value === 0));
+        assert.ok(saved.some(([key, value]) => key === 'lockRate' && value === false));
+        const shadow = b.w.document.querySelector('#xt-ds-host').shadowRoot;
+        assert.equal(shadow.querySelector('#rate').value, '0');
+        assert.equal(shadow.querySelector('#lock-rate').checked, false);
+        assert.match(shadow.querySelector('#activity').textContent, /停用.*脚本.*学堂/);
+        assert.ok(b.w.document.querySelector('.el-message-box__wrapper'), '保留平台警告供用户处理');
+
+        const plays = b.media.playCalls;
+        b.w.document.querySelector('.el-message-box__wrapper').remove();
+        b.control.start();
+        await b.tick();
+        assert.equal(b.control.app, null);
+        assert.equal(b.media.playCalls, plays);
+    } finally { b.close(); }
+});
+
+test('加载时已显示异常脚本提示则不启动播放器自动化', async () => {
+    const b = browser(course + scriptWarning, { settings: { rate: 3 } });
+    try {
+        await b.flush();
+        assert.equal(b.control.app, null);
+        assert.equal(b.media.playCalls, 0);
+        assert.equal(b.video.__xtRateLockInstalled, undefined);
     } finally { b.close(); }
 });
 
@@ -1100,6 +1197,1220 @@ for (const reason of ['自动答题关开', 'Key改回原值']) {
             respond(b.requests[1]); await b.flush(); await b.tick();
             assert.equal(b.fixture.calls.length, 1);
             assert.equal(b.fixture.closes.length, 1);
+        } finally { b.close(); }
+    });
+}
+
+/* ------------------------------------------ 智慧树作业 / 考试页适配 */
+
+const examUrl = 'https://examh5.zhihuishu.com/exam/test/9f2c';
+
+// Element UI 结构的题干卡片：.el-radio-group / .el-checkbox-group 包住选项。
+function choiceQuestion({ type = '单选题', title = '一加一等于多少？', options = ['一', '二', '三'], name = 'q1' } = {}) {
+    const multi = type === '多选题';
+    const item = multi ? 'el-checkbox' : 'el-radio';
+    const group = multi ? 'el-checkbox-group' : 'el-radio-group';
+    const inputBox = multi ? 'el-checkbox__input' : 'el-radio__input';
+    const label = multi ? 'el-checkbox__label' : 'el-radio__label';
+    return `<div class="question-item">
+        <div class="q-title"><span class="q-type">${type}</span>${title}</div>
+        <div class="${group}">${options.map((text, index) =>
+            `<label class="${item}"><span class="${inputBox}"><input type="${multi ? 'checkbox' : 'radio'}" name="${name}" value="${'ABCDEFGH'[index]}"></span><span class="${label}">${'ABCDEFGH'[index]}. ${text}</span></label>`).join('')}</div>
+    </div>`;
+}
+
+function fillQuestion({ type = '填空题', title = '水的化学式是____', blanks = 1 } = {}) {
+    const fields = type === '简答题'
+        ? '<div class="el-textarea"><textarea class="el-textarea__inner" rows="3"></textarea></div>'
+        : Array.from({ length: blanks }, () => '<div class="el-input"><input type="text" class="el-input__inner"></div>').join('');
+    return `<div class="question-item"><div class="q-title"><span class="q-type">${type}</span>${title}</div>${fields}</div>`;
+}
+
+function examPage(inner, footer = '') {
+    return `<div class="exam-container"><div class="paper">${inner}</div>${footer}</div>`;
+}
+
+const waitReal = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function drive(b, steps = 6, ms = 70) {
+    for (let index = 0; index < steps; index++) {
+        await b.tick(1200);
+        await waitReal(ms);
+    }
+    await b.flush();
+}
+
+function shadowOf(b) {
+    return b.w.document.querySelector('#xt-ds-host').shadowRoot;
+}
+
+function selectedValues(b, name) {
+    return Array.from(b.w.document.querySelectorAll(`input[name="${name}"]`))
+        .filter(input => input.checked).map(input => input.value);
+}
+
+test('元数据覆盖智慧树作业/考试页面', () => {
+    assert.match(source, /@match\s+\*:\/\/examh5\.zhihuishu\.com\/\*/);
+    assert.match(source, /@match\s+\*:\/\/exam\.zhihuishu\.com\/\*/);
+    assert.match(source, /@match\s+\*:\/\/\*\.zhihuishu\.com\/\*/);
+});
+
+test('宽匹配下非学习/考试页面不注入面板', async () => {
+    const b = browser('<div>普通页面</div>', { url: 'https://www.zhihuishu.com/career/index' });
+    try {
+        await b.flush();
+        assert.equal(b.w.document.querySelector('#xt-ds-host'), null);
+        assert.equal(b.w.__xtDs, undefined);
+    } finally { b.w.close(); }
+});
+
+test('作业/考试页自动接管：面板切到交卷布局，不要求课程目录', async () => {
+    const b = browser(examPage(choiceQuestion()), {
+        url: examUrl,
+        settings: { apiKey: 'sk-test', autoSubmit: false },
+    });
+    try {
+        await b.flush();
+        const shadow = shadowOf(b);
+        assert.ok(b.control.app, '作业/考试页应直接创建适配器，而不是等待 #coursetree');
+        assert.equal(b.control.app._stepTitle, '作业/考试');
+        assert.ok(shadow.getElementById('panel').classList.contains('quiz'), '面板应切到作业/考试布局');
+        assert.equal(shadow.getElementById('auto-submit').checked, false, '面板交卷开关应反映已保存的设置');
+        assert.match(shadow.textContent, /智慧树作业\/考试学习助手/);
+        assert.equal(b.w.confirm, b.confirm, '考试页不改写原生 confirm');
+    } finally { b.close(); }
+});
+
+test('识别题目并按 AI 答案自动选择单选，关闭自动交卷时只提示手动交卷', async () => {
+    const b = browser(examPage(choiceQuestion()), {
+        url: examUrl,
+        settings: { apiKey: 'sk-test', autoSubmit: false },
+        aiResponse: { answers: [{ id: 1, letters: ['B'], restored: '一加一等于多少？' }] },
+    });
+    try {
+        await drive(b);
+        assert.deepEqual(selectedValues(b, 'q1'), ['B']);
+        const shadow = shadowOf(b);
+        assert.match(shadow.getElementById('log').textContent, /本页 1 道题已作答/);
+        assert.match(shadow.getElementById('activity').textContent, /手动交卷/);
+        assert.match(shadow.getElementById('chapter').textContent, /本页 1 题/);
+    } finally { b.close(); }
+});
+
+test('多选题勾选多个选项，判断题按答案选择', async () => {
+    const html = examPage(
+        choiceQuestion({ type: '多选题', title: '下列哪些是偶数？', options: ['2', '3', '4'], name: 'q1' }) +
+        choiceQuestion({ type: '判断题', title: '二大于一。', options: ['正确', '错误'], name: 'q2' }),
+    );
+    const b = browser(html, {
+        url: examUrl,
+        settings: { apiKey: 'sk-test', autoSubmit: false },
+        aiResponse: { answers: [
+            { id: 1, letters: ['A', 'C'], restored: '下列哪些是偶数？' },
+            { id: 2, letters: ['A'], restored: '二大于一。' },
+        ] },
+    });
+    try {
+        await drive(b);
+        assert.deepEqual(selectedValues(b, 'q1'), ['A', 'C']);
+        assert.deepEqual(selectedValues(b, 'q2'), ['A']);
+        assert.match(shadowOf(b).getElementById('log').textContent, /多选题/);
+    } finally { b.close(); }
+});
+
+test('填空题按空数写入输入框并触发 input/change 事件', async () => {
+    const b = browser(examPage(fillQuestion({ blanks: 2, title: '水的化学式是____，氧气是____。' })), {
+        url: examUrl,
+        settings: { apiKey: 'sk-test', autoSubmit: false },
+        aiResponse: { answers: [{ id: 1, text: ['H2O', 'O2'], restored: '化学式' }] },
+    });
+    try {
+        const inputs = b.w.document.querySelectorAll('.question-item input');
+        const events = [];
+        inputs.forEach(input => ['input', 'change'].forEach(type => input.addEventListener(type, () => events.push(type))));
+        await drive(b);
+        assert.deepEqual(Array.from(inputs).map(input => input.value), ['H2O', 'O2']);
+        assert.ok(events.includes('input'), '必须派发 input 事件供 Vue 同步');
+        assert.ok(events.includes('change'), '必须派发 change 事件');
+    } finally { b.close(); }
+});
+
+test('简答题写入 textarea', async () => {
+    const answer = '物体在不受外力作用时保持静止或匀速直线运动。';
+    const b = browser(examPage(fillQuestion({ type: '简答题', title: '简述牛顿第一定律。' })), {
+        url: examUrl,
+        settings: { apiKey: 'sk-test', autoSubmit: false },
+        aiResponse: { answers: [{ id: 1, text: [answer], restored: '牛顿第一定律' }] },
+    });
+    try {
+        await drive(b);
+        assert.equal(b.w.document.querySelector('.question-item textarea').value, answer);
+    } finally { b.close(); }
+});
+
+test('“识别题目”输出题型、题干与选项', async () => {
+    const b = browser(examPage(choiceQuestion() + fillQuestion({ blanks: 1 })), {
+        url: examUrl,
+        settings: { apiKey: 'sk-test', autoSubmit: false },
+        deferAI: true,
+    });
+    try {
+        await b.flush();
+        b.control.inspect();
+        const log = shadowOf(b).getElementById('log').textContent;
+        assert.match(log, /识别到 2 道题/);
+        assert.match(log, /\[单选题\] 一加一等于多少/);
+        assert.match(log, /\[填空题\]/);
+        assert.match(log, /选项 3 个/);
+    } finally { b.close(); }
+});
+
+test('自动交卷：点击交卷、确认弹窗后停止且不重复交卷', async () => {
+    const b = browser(examPage(choiceQuestion(), '<button class="el-button" id="submit">交卷</button>'), {
+        url: examUrl,
+        settings: { apiKey: 'sk-test', autoSubmit: true },
+        aiResponse: { answers: [{ id: 1, letters: ['B'], restored: '一加一等于多少？' }] },
+        setup(w) {
+            const state = { clicks: 0, confirms: 0 };
+            w.document.getElementById('submit').addEventListener('click', () => {
+                state.clicks++;
+                const box = w.document.createElement('div');
+                box.className = 'el-message-box';
+                box.innerHTML = '<p class="el-message-box__message">确定要交卷吗？</p><button class="el-button" id="ok">确定</button>';
+                box.querySelector('#ok').addEventListener('click', () => {
+                    state.confirms++;
+                    w.document.querySelector('.paper').innerHTML = '<div class="result">已交卷，本次成绩 100 分</div>';
+                    box.remove();
+                });
+                w.document.body.appendChild(box);
+            });
+            return state;
+        },
+    });
+    try {
+        for (let index = 0; index < 14; index++) { await b.tick(1200); await waitReal(120); }
+        await b.flush();
+        assert.equal(b.fixture.clicks, 1, '只能点一次交卷');
+        assert.equal(b.fixture.confirms, 1, '应交卷确认一次');
+        assert.equal(b.control.app._stepTitle, '已交卷');
+        assert.match(shadowOf(b).getElementById('log').textContent, /交卷流程已完成/);
+        for (let index = 0; index < 4; index++) { await b.tick(1200); await waitReal(60); }
+        assert.equal(b.fixture.clicks, 1, '交卷完成后不能再次点击');
+    } finally { b.close(); }
+});
+
+test('关闭自动交卷时不点交卷按钮', async () => {
+    const b = browser(examPage(choiceQuestion(), '<button class="el-button" id="submit">交卷</button>'), {
+        url: examUrl,
+        settings: { apiKey: 'sk-test', autoSubmit: false },
+        aiResponse: { answers: [{ id: 1, letters: ['B'], restored: '一加一等于多少？' }] },
+        setup(w) {
+            const state = { clicks: 0 };
+            w.document.getElementById('submit').addEventListener('click', () => { state.clicks++; });
+            return state;
+        },
+    });
+    try {
+        await drive(b, 8);
+        assert.equal(b.fixture.clicks, 0);
+        assert.deepEqual(selectedValues(b, 'q1'), ['B'], '答案仍要填写');
+        assert.match(shadowOf(b).getElementById('log').textContent, /未开启自动交卷/);
+    } finally { b.close(); }
+});
+
+test('作业/考试页出现人工验证时暂停，不请求 AI', async () => {
+    const b = browser(examPage(choiceQuestion(), '<iframe id="tcaptcha_iframe_dy"></iframe>'), {
+        url: examUrl,
+        settings: { apiKey: 'sk-test', autoSubmit: false },
+    });
+    try {
+        await b.flush();
+        assert.equal(b.requests.length, 0, '验证码可见时不能请求 AI');
+        assert.match(shadowOf(b).getElementById('activity').textContent, /人工验证/);
+    } finally { b.close(); }
+});
+
+test('AI 返回页面不存在的选项时停止且不交卷', async () => {
+    const b = browser(examPage(choiceQuestion(), '<button class="el-button" id="submit">交卷</button>'), {
+        url: examUrl,
+        settings: { apiKey: 'sk-test', autoSubmit: true },
+        aiResponse: { answers: [{ id: 1, letters: ['Z'], restored: '一加一等于多少？' }] },
+        setup(w) {
+            const state = { submits: 0 };
+            w.document.getElementById('submit').addEventListener('click', () => { state.submits++; });
+            return state;
+        },
+    });
+    try {
+        await drive(b, 5);
+        assert.equal(b.fixture.submits, 0);
+        assert.deepEqual(selectedValues(b, 'q1'), []);
+        assert.match(shadowOf(b).getElementById('log').textContent, /不存在的选项/);
+    } finally { b.close(); }
+});
+
+test('切题未渲染完成时不会重复点击“下一题”', async () => {
+    const html = examPage(choiceQuestion(), '<button class="el-button" id="next">下一题</button>');
+    const b = browser(html, {
+        url: examUrl,
+        settings: { apiKey: 'sk-test', autoSubmit: false },
+        aiResponse: { answers: [{ id: 1, letters: ['B'], restored: '一加一等于多少？' }] },
+        setup(w) {
+            const state = { clicks: 0 };
+            w.document.getElementById('next').addEventListener('click', () => { state.clicks++; });
+            return state;
+        },
+    });
+    try {
+        for (let index = 0; index < 6; index++) { await b.tick(1200); await waitReal(90); }
+        assert.equal(b.fixture.clicks, 1, '同一页在渲染完成前只能点一次下一题');
+    } finally { b.close(); }
+});
+
+test('作业/考试页未填写 Key 时等待作答而不发请求', async () => {
+    const b = browser(examPage(choiceQuestion()), { url: examUrl, settings: { autoSubmit: false } });
+    try {
+        await drive(b, 4);
+        assert.equal(b.requests.length, 0);
+        assert.match(shadowOf(b).getElementById('activity').textContent, /未填写 DeepSeek API Key/);
+    } finally { b.close(); }
+});
+
+test('考试纯图片题干与选项都通过 image_url 发送，文字和上下标按顺序保留', async () => {
+    const b = browser(examPage(choiceQuestion({
+        title: '<p>x<sup>2</sup> + a<sub>n</sub>，先看<img src="/question-a.png" alt="公式甲">再看<img src="/question-b.png">求解</p>',
+        options: ['<img src="/option-a.png">', '<img src="/option-b.png">'],
+    })), { url: examUrl, settings: { apiKey: 'sk-test' }, deferAI: true });
+    try {
+        await b.flush();
+        assert.equal(b.requests.length, 1, '不能丢弃纯图片选项');
+        const question = b.control.app.inspectQuiz()[0];
+        assert.match(question.question, /x\^\(2\).*a_\(n\).*\[图片1：公式甲\].*再看.*\[图片2\].*求解/);
+        assert.equal(question.imageCount, 4);
+        assert.deepEqual(Array.from(question.options), ['A. [图片1]', 'B. [图片1]']);
+        const content = JSON.parse(b.requests[0].data).messages[1].content;
+        assert.ok(Array.isArray(content), '应传递多模态内容');
+        assert.deepEqual(content.filter(part => part.type === 'image_url').map(part => part.image_url.url), [
+            'https://examh5.zhihuishu.com/question-a.png', 'https://examh5.zhihuishu.com/question-b.png',
+            'https://examh5.zhihuishu.com/option-a.png', 'https://examh5.zhihuishu.com/option-b.png',
+        ]);
+    } finally { b.close(); }
+});
+
+for (const location of ['题干', '选项']) {
+    test(`考试等待响应时${location}换图会丢弃旧结果并重新请求`, async () => {
+        const b = browser(examPage(choiceQuestion({
+            title: '根据图中公式<img src="/question.png">选择答案。',
+            options: ['公式甲<img src="/a.png">', '公式乙<img src="/b.png">'],
+        })), { url: examUrl, settings: { apiKey: 'sk-test' }, deferAI: true });
+        try {
+            await b.flush(); assert.equal(b.requests.length, 1);
+            b.w.document.querySelector(location === '题干' ? '.q-title img' : '.el-radio__label img').src = '/replacement.png';
+            respond(b.requests[0]); await b.flush();
+            assert.deepEqual(selectedValues(b, 'q1'), [], '图片变化后旧答案不可写入');
+            await b.tick();
+            assert.equal(b.requests.length, 2, '相同占位文字但不同图片也要重新识别');
+            respond(b.requests[1]); await b.flush();
+            assert.deepEqual(selectedValues(b, 'q1'), ['B']);
+        } finally { b.close(); }
+    });
+}
+
+for (const reason of ['验证码', '保存Key', '自动答题关后重开']) {
+    test(`考试请求期间${reason}撤销旧结果，同题随后可以恢复`, async () => {
+        const b = browser(examPage(choiceQuestion(), '<iframe id="tcaptcha_iframe_dy" style="display:none"></iframe>'), {
+            url: examUrl, settings: { apiKey: 'sk-test' }, deferAI: true,
+        });
+        try {
+            await b.flush(); assert.equal(b.requests.length, 1);
+            const shadow = shadowOf(b), checkbox = shadow.querySelector('#auto-quiz');
+            const captcha = b.w.document.querySelector('#tcaptcha_iframe_dy');
+            if (reason === '验证码') { captcha.style.display = 'block'; await b.tick(); }
+            if (reason === '保存Key') {
+                const key = shadow.querySelector('#key');
+                key.value = 'sk-replacement'; key.dispatchEvent(new b.w.Event('input'));
+                shadow.querySelector('[data-act="save-key"]').click();
+            }
+            if (reason === '自动答题关后重开') {
+                checkbox.checked = false; checkbox.dispatchEvent(new b.w.Event('change'));
+                checkbox.checked = true; checkbox.dispatchEvent(new b.w.Event('change'));
+            }
+            respond(b.requests[0]); await b.flush();
+            assert.deepEqual(selectedValues(b, 'q1'), [], '已撤销请求不能点击选项');
+            if (reason === '验证码') captcha.style.display = 'none';
+            await b.tick(); assert.equal(b.requests.length, 2, '同题可以重新请求');
+            if (reason === '保存Key') assert.equal(b.requests[1].headers.Authorization, 'Bearer sk-replacement');
+            respond(b.requests[1]); await b.flush();
+            assert.deepEqual(selectedValues(b, 'q1'), ['B']);
+        } finally { b.close(); }
+    });
+}
+
+test('考试题干只有图片时仍可识别并请求', async () => {
+    const b = browser(examPage(choiceQuestion({ title: '<img src="/question-only.png">' })), {
+        url: examUrl, settings: { apiKey: 'sk-test' }, deferAI: true,
+    });
+    try {
+        await b.flush();
+        assert.equal(b.requests.length, 1);
+        assert.equal(b.control.app.inspectQuiz()[0].imageCount, 1);
+    } finally { b.close(); }
+});
+
+for (const reason of ['停止', '换题', '关闭自动答题', '更换Key']) {
+    test(`考试多选第一个选项后${reason}时不再操作其余选项和下一题`, async () => {
+        const b = browser(examPage(choiceQuestion({ type: '多选题' }), '<button id="next">下一题</button>'), {
+            url: examUrl, settings: { apiKey: 'sk-test' }, deferAI: true,
+            setup(w) {
+                const state = { next: 0 };
+                w.document.querySelector('#next').addEventListener('click', () => state.next++);
+                w.document.querySelector('input[value="A"]').addEventListener('change', () => {
+                    if (reason === '停止') w.__xtDs.stop('测试中途停止');
+                    if (reason === '换题') w.document.querySelector('.q-title').innerHTML = '<span class="q-type">多选题</span>这是新题干';
+                    const shadow = w.document.querySelector('#xt-ds-host').shadowRoot;
+                    if (reason === '关闭自动答题') {
+                        const checkbox = shadow.querySelector('#auto-quiz');
+                        checkbox.checked = false; checkbox.dispatchEvent(new w.Event('change'));
+                    }
+                    if (reason === '更换Key') {
+                        const key = shadow.querySelector('#key'); key.value = 'sk-new'; key.dispatchEvent(new w.Event('input'));
+                    }
+                });
+                return state;
+            },
+        });
+        try {
+            await b.flush(); assert.equal(b.requests.length, 1);
+            respond(b.requests[0], ['A', 'C']); await b.flush(); await b.flush();
+            assert.deepEqual(selectedValues(b, 'q1'), ['A'], '上下文失效后不能继续勾选 C');
+            assert.equal(b.fixture.next, 0, '取消之后不能翻页');
+        } finally { b.close(); }
+    });
+}
+
+test('考试相同内容但题号不同的分页分别填写', async () => {
+    const b = browser(examPage(choiceQuestion({ name: 'question-101' })), {
+        url: examUrl, settings: { apiKey: 'sk-test' }, deferAI: true,
+        setup(w) { w.document.querySelector('.question-item').dataset.questionId = '101'; },
+    });
+    try {
+        await b.flush(); respond(b.requests[0]); await b.flush(); await b.flush();
+        assert.deepEqual(selectedValues(b, 'question-101'), ['B']);
+        b.w.document.querySelector('.paper').innerHTML = choiceQuestion({ name: 'question-102' });
+        b.w.document.querySelector('.question-item').dataset.questionId = '102';
+        await b.tick();
+        assert.equal(b.requests.length, 2, '题号不同且未填写的下一页需要独立作答');
+        respond(b.requests[1]); await b.flush(); await b.flush();
+        assert.deepEqual(selectedValues(b, 'question-102'), ['B']);
+    } finally { b.close(); }
+});
+
+test('考试下一题按钮暂时 disabled 时持续等待，不把当前页当末页交卷', async () => {
+    const b = browser(examPage(choiceQuestion(), '<button id="next" disabled>下一题</button><button id="submit">交卷</button>'), {
+        url: examUrl, settings: { apiKey: 'sk-test', autoSubmit: true },
+        setup(w) {
+            const state = { submits: 0, next: 0 };
+            w.document.querySelector('#submit').addEventListener('click', () => state.submits++);
+            w.document.querySelector('#next').addEventListener('click', () => state.next++);
+            return state;
+        },
+    });
+    try {
+        await b.flush(); await b.flush();
+        for (let i = 0; i < 6; i++) await b.tick(1200);
+        assert.equal(b.fixture.submits, 0, '按钮存在但未启用不能证明已经末页');
+        b.w.document.querySelector('#next').disabled = false;
+        await b.tick();
+        assert.equal(b.fixture.next, 1, '按钮恢复后正常翻页');
+    } finally { b.close(); }
+});
+
+test('考试 contenteditable 已填草稿不作为题干，写入答案后不重复请求', async () => {
+    const b = browser(examPage('<div class="question-item"><div class="q-title"><span class="q-type">简答题</span>简述水循环。</div><div contenteditable="true">学生已有的草稿</div></div>'), {
+        url: examUrl, settings: { apiKey: 'sk-test' },
+        aiResponse: { answers: [{ id: 1, text: ['蒸发、凝结和降水。'] }] },
+        setup(w) {
+            // jsdom 不提供 isContentEditable；真实浏览器中该属性由 contenteditable 派生。
+            Object.defineProperty(w.HTMLElement.prototype, 'isContentEditable', {
+                configurable: true, get() { return this.getAttribute('contenteditable') === 'true'; },
+            });
+        },
+    });
+    try {
+        await b.flush(); await b.flush();
+        assert.equal(b.control.app.inspectQuiz()[0].question, '简述水循环。', '富文本输入内容不能混入题干');
+        assert.equal(b.w.document.querySelector('[contenteditable]').textContent, '蒸发、凝结和降水。');
+        for (let i = 0; i < 5; i++) await b.tick(1200);
+        assert.equal(b.requests.length, 1, '写入 contenteditable 不改变题目身份');
+    } finally { b.close(); }
+});
+
+for (const [name, title, footer] of [
+    ['题干引用提交成功', '阅读“提交成功”提示后，应如何核对成绩？', ''],
+    ['题干引用得分', '若界面显示“得分：80”，应如何解释？', ''],
+    ['隐藏结果模板', '一加一等于多少？', '<div class="result" style="display:none">考试已结束</div>'],
+]) {
+    test(`考试完成识别排除${name}`, async () => {
+        const b = browser(examPage(choiceQuestion({ title }), footer), {
+            url: examUrl, settings: { apiKey: 'sk-test' }, deferAI: true,
+        });
+        try {
+            await b.flush();
+            assert.equal(b.requests.length, 1, '完成文案必须来自可见结果提示，题目仍需识别');
+            assert.notEqual(b.control.app._stepTitle, '已交卷');
+        } finally { b.close(); }
+    });
+}
+
+test('考试可见结果区域的完成文案停止请求', async () => {
+    const b = browser(examPage('', '<div class="result">已交卷，本次成绩 100 分</div>'), {
+        url: examUrl, settings: { apiKey: 'sk-test' }, deferAI: true,
+    });
+    try {
+        await b.flush(); await b.tick();
+        assert.equal(b.requests.length, 0);
+        assert.equal(b.control.app._stepTitle, '已交卷');
+    } finally { b.close(); }
+});
+
+test('考试同页等待响应及填写完成后均不重复请求', async () => {
+    const b = browser(examPage(choiceQuestion()), { url: examUrl, settings: { apiKey: 'sk-test' }, deferAI: true });
+    try {
+        await b.flush();
+        for (let i = 0; i < 5; i++) await b.tick(1200);
+        assert.equal(b.requests.length, 1, '等待期间同页只允许一个请求');
+        respond(b.requests[0]); await b.flush(); await b.flush();
+        for (let i = 0; i < 5; i++) await b.tick(1200);
+        assert.equal(b.requests.length, 1, '已填同页不能再次调用 API');
+        assert.deepEqual(selectedValues(b, 'q1'), ['B']);
+    } finally { b.close(); }
+});
+
+test('考试自动交卷默认关闭，沿用原有 Key 只填答案', async () => {
+    const b = browser(examPage(choiceQuestion(), '<button id="submit">交卷</button>'), {
+        url: examUrl, settings: { apiKey: 'sk-existing' },
+        setup(w) {
+            const state = { submits: 0 };
+            w.document.querySelector('#submit').addEventListener('click', () => state.submits++);
+            return state;
+        },
+    });
+    try {
+        await b.flush(); await b.flush();
+        assert.equal(shadowOf(b).querySelector('#auto-submit').checked, false);
+        assert.equal(b.requests[0].headers.Authorization, 'Bearer sk-existing');
+        for (let i = 0; i < 6; i++) await b.tick(1200);
+        assert.deepEqual(selectedValues(b, 'q1'), ['B']);
+        assert.equal(b.fixture.submits, 0);
+    } finally { b.close(); }
+});
+
+test('考试同页 26 张图片分批请求，每批至多 24 张并正确映射全页题号', async () => {
+    const html = Array.from({ length: 13 }, (_, index) => choiceQuestion({
+        name: `batch-${index + 1}`, title: `批次题${index + 1}<img src="/question-${index + 1}.png">`,
+        options: [`图示答案<img src="/option-${index + 1}.png">`, '文字答案'],
+    })).join('');
+    const b = browser(examPage(html), {
+        url: examUrl, settings: { apiKey: 'sk-test' }, deferAI: true,
+        setup(w) {
+            const request = w.GM_xmlhttpRequest;
+            const state = { batches: [] };
+            w.GM_xmlhttpRequest = details => {
+                request(details);
+                const content = JSON.parse(details.data).messages[1].content;
+                const payload = JSON.parse(Array.isArray(content) ? content[0].text : content);
+                state.batches.push({ questions: payload.length, images: Array.isArray(content) ? content.filter(part => part.type === 'image_url').length : 0 });
+                // 按每批自己的 id 回答，用全页题干编号交替选择，验证不能跨批错位。
+                const answers = payload.map(item => ({
+                    id: item.id, letters: [Number(item.question.match(/批次题(\d+)/)[1]) % 2 ? 'A' : 'B'],
+                }));
+                details.onload({ status: 200, responseText: JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ answers }) } }] }) });
+            };
+            return state;
+        },
+    });
+    try {
+        for (let i = 0; i < 30; i++) await b.flush();
+        assert.ok(b.requests.length >= 2, '整页 26 张图片不能作为单次超限请求');
+        assert.ok(b.fixture.batches.every(batch => batch.images > 0 && batch.images <= 24), '每批必须保留图片并遵守 24 张上限');
+        assert.equal(b.fixture.batches.reduce((sum, batch) => sum + batch.questions, 0), 13, '全部题目各请求一次');
+        for (let i = 1; i <= 13; i++) {
+            assert.deepEqual(selectedValues(b, `batch-${i}`), [i % 2 ? 'A' : 'B'], `第 ${i} 题应使用其对应批次答案`);
+        }
+    } finally { b.close(); }
+});
+
+test('考试原生 radio 通过题号和 name 分别识别同页两题', async () => {
+    const html = [
+        ['q1', '1. 一加一等于多少？', '一', '二'],
+        ['q2', '2. 二加二等于多少？', '三', '四'],
+    ].map(([name, title, a, b]) => `<div class="question-item"><div>${title}</div><div><label><input type="radio" name="${name}" value="A">A. ${a}</label><label><input type="radio" name="${name}" value="B">B. ${b}</label></div></div>`).join('');
+    const b = browser(examPage(html), {
+        url: examUrl, settings: { apiKey: 'sk-test' },
+        aiResponse: { answers: [{ id: 1, letters: ['B'] }, { id: 2, letters: ['B'] }] },
+    });
+    try {
+        await b.flush(); await b.flush();
+        assert.equal(b.control.app.inspectQuiz().length, 2, '原生 input 分组不能把多道题合并');
+        assert.deepEqual(selectedValues(b, 'q1'), ['B']);
+        assert.deepEqual(selectedValues(b, 'q2'), ['B']);
+    } finally { b.close(); }
+});
+
+test('考试填空题两个 textarea 按两个空请求并分别填写', async () => {
+    const b = browser(examPage('<div class="question-item"><div>填空题 水的化学式是___，氧气是___。</div><textarea></textarea><textarea></textarea></div>'), {
+        url: examUrl, settings: { apiKey: 'sk-test' },
+        aiResponse: { answers: [{ id: 1, text: ['H2O', 'O2'] }] },
+    });
+    try {
+        await b.flush(); await b.flush();
+        assert.equal(b.requests.length, 1);
+        const content = JSON.parse(b.requests[0].data).messages[1].content;
+        assert.equal(JSON.parse(content)[0].blanks, 2, 'textarea 也可承载填空，不能漏计空数');
+        assert.deepEqual(Array.from(b.w.document.querySelectorAll('.question-item textarea')).map(field => field.value), ['H2O', 'O2']);
+    } finally { b.close(); }
+});
+
+test('考试同页连续三次设置取消不消耗失败次数，第四次请求仍能完成', async () => {
+    const b = browser(examPage(choiceQuestion()), { url: examUrl, settings: { apiKey: 'sk-test' }, deferAI: true });
+    try {
+        await b.flush();
+        for (let i = 0; i < 3; i++) {
+            assert.equal(b.requests.length, i + 1);
+            const shadow = shadowOf(b);
+            if (i % 2 === 0) {
+                const checkbox = shadow.querySelector('#auto-quiz');
+                checkbox.checked = false; checkbox.dispatchEvent(new b.w.Event('change'));
+                checkbox.checked = true; checkbox.dispatchEvent(new b.w.Event('change'));
+            } else {
+                const key = shadow.querySelector('#key');
+                key.value = 'sk-replacement'; key.dispatchEvent(new b.w.Event('input'));
+                shadow.querySelector('[data-act="save-key"]').click();
+            }
+            respond(b.requests[i]); await b.flush(); await b.flush();
+            assert.deepEqual(selectedValues(b, 'q1'), []);
+            assert.equal(b.control.app._failures.size, 0, '主动取消不能记作请求失败');
+            assert.equal(b.control.app._fatal, false, '主动取消不能触发永久停止');
+            await b.tick();
+        }
+        assert.equal(b.requests.length, 4, '三次取消后仍允许第四次请求');
+        respond(b.requests[3]); await b.flush(); await b.flush();
+        assert.deepEqual(selectedValues(b, 'q1'), ['B']);
+    } finally { b.close(); }
+});
+
+test('考试下一题按钮暂时隐藏时持续等待，恢复显示后只翻页一次', async () => {
+    const b = browser(examPage(choiceQuestion(), '<button id="next" hidden>下一题</button><button id="submit">交卷</button>'), {
+        url: examUrl, settings: { apiKey: 'sk-test', autoSubmit: true },
+        setup(w) {
+            const state = { submits: 0, next: 0 };
+            w.document.querySelector('#submit').addEventListener('click', () => state.submits++);
+            w.document.querySelector('#next').addEventListener('click', () => state.next++);
+            return state;
+        },
+    });
+    try {
+        await b.flush(); await b.flush();
+        for (let i = 0; i < 6; i++) await b.tick(1200);
+        assert.equal(b.fixture.submits, 0, '隐藏下一题不能作为末页证据');
+        b.w.document.querySelector('#next').hidden = false;
+        await b.tick(); await b.tick();
+        assert.equal(b.fixture.next, 1, '恢复显示后同页只请求一次翻页');
+    } finally { b.close(); }
+});
+
+/* 真实 onlineexamh5new 前端（公开模块 807/808/857/1364）的题目及保存结构。 */
+const webExamUrl = 'https://onlineexamh5new.zhihuishu.com/stuExamWeb.html';
+
+function webJudgeQuestion({ id = 'eid-101', number = 1, title = '一加一等于二。', options = ['错', '对'] } = {}) {
+    return `<div class="examPaper_subject mt20">
+        <div class="subject_stem clearfix"><div class="subject_type_describe fl">
+            <div class="subject_num fl"><span id="anchor_${id}">${number}</span></div>
+            <div class="subject_type_annex"><span class="subject_type"><span>【判断题】</span><span>(1分)</span></span></div>
+            <div class="subject_describe dynamic-fonts"><div>${title}</div></div>
+        </div></div>
+        <div class="subject_node">${options.map((content, index) => `<div class="nodeLab"><div class="label clearfix">
+            <div class="fl" style="padding:10px 0"><input class="mr30" type="radio" name="${id}" value="option-${index + 1}" style="display:none"><img class="flagChecked" src="/state.png"><span class="mr10">${'ABCDEFGH'[index]}.</span></div>
+            <div class="node_detail examquestions-answer fl dynamic-fonts">${content}</div>
+        </div></div>`).join('')}</div>
+    </div>`;
+}
+
+function webExamPage(question, last = false) {
+    return `<div id="app"><div class="examPaper">${question}</div><div class="switch-btn-box"><button class="el-button" disabled>上一题</button><button class="el-button" id="web-save-next">${last ? '保存' : '下一题'}</button></div><p class="switch-btn-warn">答题后请点【下一题】保存答案，全部试题答完后请点击右上角【提交】按钮完成答题，避免答题记录丢失！</p><button id="web-submit">提交</button></div>`;
+}
+
+function webJudgeSetup({ nextQuestion = null, multi = false } = {}) {
+    return w => {
+        const state = { optionClicks: [], saves: [], submits: 0, saved: false };
+        const wireChoices = () => {
+            for (const node of w.document.querySelectorAll('.nodeLab')) {
+                node.addEventListener('click', () => {
+                    const letter = node.querySelector('.mr10').textContent.replace('.', '');
+                    state.optionClicks.push(letter);
+                    if (!multi) for (const selected of w.document.querySelectorAll('.onChecked')) selected.classList.remove('onChecked');
+                    node.querySelector('.mr10').classList.toggle('onChecked', multi ? !node.querySelector('.mr10').classList.contains('onChecked') : true);
+                    node.querySelector('.node_detail').classList.toggle('onChecked', node.querySelector('.mr10').classList.contains('onChecked'));
+                    // 公开前端 UpdateName 把 judges 设为 eid，hidden input.checked 不能代表选中。
+                });
+            }
+        };
+        wireChoices();
+        w.document.querySelector('#web-submit').addEventListener('click', () => state.submits++);
+        w.document.querySelector('#web-save-next').addEventListener('click', () => {
+            state.saves.push(Array.from(w.document.querySelectorAll('.nodeLab .mr10.onChecked')).map(node => node.textContent.replace('.', '')).join(','));
+        });
+        state.finishSave = () => {
+            state.saved = true;
+            if (nextQuestion) {
+                w.document.querySelector('.examPaper').innerHTML = nextQuestion;
+                w.document.querySelector('#web-save-next').textContent = '保存';
+                wireChoices();
+            } else {
+                const message = w.document.createElement('div'); message.className = 'el-message el-message--success';
+                message.textContent = '保存成功'; w.document.body.appendChild(message);
+            }
+        };
+        return state;
+    };
+}
+
+test('真实新考试页识别自绘判断 A错B对，按 onChecked 选中并调用下一题保存一次', async () => {
+    const b = browser(webExamPage(webJudgeQuestion()), {
+        url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webJudgeSetup(), deferAI: true,
+    });
+    try {
+        await b.flush();
+        const questions = b.control.app.inspectQuiz();
+        assert.equal(questions.length, 1, '没有可见 input 的自绘题目仍需识别');
+        assert.equal(questions[0].type, '判断题');
+        assert.equal(questions[0].question, '一加一等于二。');
+        assert.deepEqual(Array.from(questions[0].options), ['A. 错', 'B. 对']);
+        assert.equal(questions[0].imageCount, 0, 'flagChecked 图标不属于题目图片');
+        assert.equal(b.requests.length, 1);
+        respond(b.requests[0]); await b.flush(); await b.flush();
+        assert.deepEqual(b.fixture.optionClicks, ['B']);
+        assert.equal(b.w.document.querySelectorAll('input:checked').length, 0, '此真实结构由 onChecked 表示选中');
+        assert.deepEqual(b.fixture.saves, ['B'], '点击下一题让原平台保存答案');
+        await b.tick(); await b.tick();
+        assert.equal(b.fixture.saves.length, 1, '保存响应未返回前不能重复点击下一题');
+        assert.equal(b.fixture.submits, 0);
+    } finally { b.close(); }
+});
+
+test('真实新考试页最后一道题点保存且默认不交卷，保存成功不误判已交卷', async () => {
+    const b = browser(webExamPage(webJudgeQuestion(), true), {
+        url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webJudgeSetup(), deferAI: true,
+    });
+    try {
+        await b.flush();
+        assert.equal(b.requests.length, 1, '最后一题也需要识别');
+        respond(b.requests[0]); await b.flush(); await b.flush();
+        assert.deepEqual(b.fixture.saves, ['B'], '最后题的保存按钮必须调用');
+        b.fixture.finishSave();
+        for (let i = 0; i < 5; i++) await b.tick(1200);
+        assert.equal(b.fixture.saves.length, 1, '保存成功后不重复保存');
+        assert.equal(b.fixture.submits, 0, '默认不点击提交');
+        assert.notEqual(b.control.app._stepTitle, '已交卷', '保存成功与试卷提交成功不同');
+    } finally { b.close(); }
+});
+
+test('真实新考试页下一题等待原平台异步保存成功后再处理后题', async () => {
+    const b = browser(webExamPage(webJudgeQuestion()), {
+        url: webExamUrl, settings: { apiKey: 'sk-test' }, deferAI: true,
+        setup: webJudgeSetup({ nextQuestion: webJudgeQuestion({ id: 'eid-102', number: 2, title: '二加二等于五。' }) }),
+    });
+    try {
+        await b.flush(); assert.equal(b.requests.length, 1);
+        respond(b.requests[0]); await b.flush(); await b.flush();
+        assert.deepEqual(b.fixture.saves, ['B']);
+        for (let i = 0; i < 3; i++) await b.tick(1200);
+        assert.equal(b.requests.length, 1, '保存延迟时原题不重复请求');
+        assert.equal(b.fixture.saves.length, 1, '保存延迟时下一题不连点');
+        // 页面原saveSuccess事件只有返回成功才更新currentQuestionIndex并渲染下一题。
+        b.fixture.finishSave();
+        await b.tick();
+        assert.equal(b.requests.length, 2, '平台确认保存并渲染后识别下一题');
+        respond(b.requests[1], ['A']); await b.flush(); await b.flush();
+        assert.deepEqual(b.fixture.optionClicks, ['B', 'A']);
+        assert.deepEqual(b.fixture.saves, ['B', 'A'], '末题也要通过保存按钮保存');
+        assert.equal(b.fixture.submits, 0);
+    } finally { b.close(); }
+});
+
+test('真实新考试页封闭题干且组件不可达时明确暂停，不把题型分值当题干', async () => {
+    const b = browser(webExamPage(webJudgeQuestion({ title: '' })), {
+        url: webExamUrl, settings: { apiKey: 'sk-test' }, deferAI: true,
+        setup(w) {
+            const fixture = webJudgeSetup()(w);
+            const stem = w.document.querySelector('.subject_describe > div');
+            stem.attachShadow({ mode: 'closed' }).innerHTML = '<p>此处实际题干位于封闭 Shadow DOM 内。</p>';
+            // 公开页面 hijackAllEls 会隐藏所有 __vue__，不能假设组件始终可访问。
+            for (const element of w.document.querySelectorAll('*')) {
+                Object.defineProperty(element, '__vue__', { configurable: true, get() {}, set() {} });
+            }
+            return fixture;
+        },
+    });
+    try {
+        await b.flush(); await b.tick();
+        assert.equal(b.requests.length, 0, '题干不可读时禁止仅发送判断题/分值让模型猜');
+        assert.equal(b.fixture.optionClicks.length, 0);
+        assert.equal(b.fixture.saves.length, 0);
+        assert.match(shadowOf(b).getElementById('activity').textContent, /题干.*(?:读取|不可|封闭|手动)|封闭.*题干/, '应向用户说明题干不可读取');
+    } finally { b.close(); }
+});
+
+test('真实新考试页仅处理当前可见题，预渲染的隐藏题不请求不点击', async () => {
+    const html = `<div>${webJudgeQuestion()}</div><div style="display:none">${webJudgeQuestion({ id: 'eid-hidden', number: 2, title: '尚未显示的下一题。' })}</div>`;
+    const b = browser(webExamPage(html), {
+        url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webJudgeSetup(), deferAI: true,
+    });
+    try {
+        await b.flush();
+        assert.equal(b.control.app.inspectQuiz().length, 1, 'v-show隐藏题不能并入当前页');
+        assert.equal(b.requests.length, 1);
+        const content = JSON.parse(b.requests[0].data).messages[1].content;
+        const payload = JSON.parse(Array.isArray(content) ? content[0].text : content);
+        assert.equal(payload.length, 1);
+        assert.doesNotMatch(payload[0].question, /尚未显示/);
+        respond(b.requests[0]); await b.flush(); await b.flush();
+        assert.deepEqual(b.fixture.optionClicks, ['B']);
+        assert.equal(b.w.document.querySelectorAll('[style="display:none"] .onChecked').length, 0);
+    } finally { b.close(); }
+});
+
+test('真实新考试页简答输入后先触发 blur 建立答案，再调用下一题保存', async () => {
+    const question = webJudgeQuestion({ title: '简述水循环。' })
+        .replace('【判断题】', '【简答题】').replace(/<div class="subject_node">[\s\S]*?<\/div>\s*<\/div>$/, '<div class="subject_node mt10"><textarea class="text_textarea" rows="20"></textarea></div></div>');
+    const b = browser(webExamPage(question), {
+        url: webExamUrl, settings: { apiKey: 'sk-test' },
+        aiResponse: { answers: [{ id: 1, text: ['蒸发、凝结和降水。'] }] },
+        setup(w) {
+            const state = { input: '', answerDataTemp: '', events: [], saved: [] };
+            const field = w.document.querySelector('textarea.text_textarea');
+            assert.ok(field, '使用真实简答 textarea 结构');
+            field.addEventListener('focus', () => state.events.push('focus'));
+            field.addEventListener('input', () => { state.input = field.value; state.events.push('input'); });
+            field.addEventListener('blur', () => { state.answerDataTemp = state.input; state.events.push('blur'); });
+            w.document.querySelector('#web-save-next').addEventListener('click', () => {
+                state.events.push('save'); state.saved.push(state.answerDataTemp);
+            });
+            return state;
+        },
+    });
+    try {
+        await b.flush(); await b.flush();
+        assert.equal(b.requests.length, 1);
+        assert.equal(b.w.document.querySelector('textarea').value, '蒸发、凝结和降水。');
+        assert.ok(b.fixture.events.indexOf('focus') >= 0 && b.fixture.events.indexOf('focus') < b.fixture.events.indexOf('input'), '先激活真实输入框再更新文本');
+        assert.ok(b.fixture.events.indexOf('blur') > b.fixture.events.indexOf('input'), '真实组件依赖 blur 提交输入状态');
+        assert.ok(b.fixture.events.indexOf('save') > b.fixture.events.indexOf('blur'), '必须先准备答案再保存');
+        assert.deepEqual(b.fixture.saved, ['蒸发、凝结和降水。']);
+    } finally { b.close(); }
+});
+
+test('真实新考试页多选清除原有错误项并选中全部目标后保存', async () => {
+    const question = webJudgeQuestion({ title: '下列哪些是偶数？', options: ['2', '3', '4'] })
+        .replace('【判断题】', '【多选题】').replaceAll('type="radio"', 'type="checkbox"');
+    const b = browser(webExamPage(question), {
+        url: webExamUrl, settings: { apiKey: 'sk-test' }, deferAI: true,
+        setup(w) {
+            const fixture = webJudgeSetup({ multi: true })(w);
+            const option = w.document.querySelectorAll('.nodeLab')[1];
+            option.querySelector('.mr10').classList.add('onChecked'); option.querySelector('.node_detail').classList.add('onChecked');
+            return fixture;
+        },
+    });
+    try {
+        await b.flush(); assert.equal(b.requests.length, 1);
+        respond(b.requests[0], ['A', 'C']);
+        for (let i = 0; i < 4; i++) await b.flush();
+        assert.deepEqual(b.fixture.optionClicks, ['B', 'A', 'C']);
+        assert.deepEqual(b.fixture.saves, ['A,C']);
+        assert.equal(b.fixture.submits, 0);
+    } finally { b.close(); }
+});
+
+test('真实新考试页图片只取题干与选项正文，状态图标不进入模型请求', async () => {
+    const question = webJudgeQuestion({
+        title: '<p>设x<sup>2</sup>，见<img src="/stem-1.png">求结果。</p>',
+        options: ['<img src="/option-1.png">', '<img src="/option-2.png">'],
+    }).replace('【判断题】', '【单选题】');
+    const b = browser(webExamPage(question), {
+        url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webJudgeSetup(), deferAI: true,
+    });
+    try {
+        await b.flush(); assert.equal(b.requests.length, 1);
+        const q = b.control.app.inspectQuiz()[0];
+        assert.match(q.question, /x\^\(2\).*\[图片1\]/);
+        assert.equal(q.imageCount, 3);
+        const content = JSON.parse(b.requests[0].data).messages[1].content;
+        assert.deepEqual(content.filter(part => part.type === 'image_url').map(part => part.image_url.url), [
+            'https://onlineexamh5new.zhihuishu.com/stem-1.png',
+            'https://onlineexamh5new.zhihuishu.com/option-1.png',
+            'https://onlineexamh5new.zhihuishu.com/option-2.png',
+        ]);
+        assert.ok(content.filter(part => part.type === 'image_url').every(part => !part.image_url.url.endsWith('/state.png')));
+    } finally { b.close(); }
+});
+
+const webExamDataUrl = 'https://taurusexam-api.zhihuishu.com/taurusExam/gateway/t/v1/student/doExam';
+const webHomeworkDataUrl = 'https://studentexam-api.zhihuishu.com/studentExam/gateway/t/v1/student/doHomework';
+
+function webExamQuestionData(overrides = {}) {
+    return { eid: 'eid101', name: '<p>一加一等于二。</p>', questionType: { id: 14, name: '判断题' },
+        questionOptions: [{ id: 'option-1', content: '错', flagChecked: false }, { id: 'option-2', content: '对', flagChecked: false }],
+        questionDatas: [], ...overrides };
+}
+
+function webExamResponse(question = webExamQuestionData()) {
+    return { status: 200, rt: { examBase: { workExamParts: [{ questionDtos: [question] }] } } };
+}
+
+function webExamXHRSetup({ url = webExamDataUrl } = {}) {
+    return w => {
+        const fixture = webJudgeSetup()(w);
+        const stem = w.document.querySelector('.subject_describe > div');
+        stem.replaceChildren();
+        stem.attachShadow({ mode: 'closed' }).innerHTML = '<p>一加一等于二。</p>';
+        for (const element of w.document.querySelectorAll('*')) {
+            Object.defineProperty(element, '__vue__', { configurable: true, get() {}, set() {} });
+        }
+        const sent = [], opened = [], sendResult = {};
+        class FixtureXHR extends w.EventTarget {
+            constructor() { super(); this.status = 0; this.responseURL = ''; this.responseText = ''; this.response = ''; this.responseType = ''; }
+            open(...args) { opened.push(args); }
+            send(...args) { sent.push({ receiver: this, args }); return sendResult; }
+            emit(data, { responseURL = url, status = 200, responseType = '' } = {}) {
+                this.status = status; this.responseURL = responseURL; this.responseType = responseType;
+                this.responseText = responseType === 'json' ? '' : JSON.stringify(data);
+                this.response = responseType === 'json' ? data : this.responseText;
+                this.dispatchEvent(new w.Event('load'));
+            }
+        }
+        w.XMLHttpRequest = FixtureXHR;
+        // 页面可在 userscript 执行前 new XHR，send 时仍应被正常监听。
+        const xhr = new w.XMLHttpRequest();
+        const original = { constructor: w.XMLHttpRequest, open: w.XMLHttpRequest.prototype.open,
+            attachShadow: w.Element.prototype.attachShadow, send: w.XMLHttpRequest.prototype.send };
+        return { ...fixture, xhr, sent, opened, sendResult, original };
+    };
+}
+
+for (const url of [webExamDataUrl, webHomeworkDataUrl]) {
+    test(`真实新考试页封闭题干从正常白名单 XHR 响应读取：${url.includes('doHomework') ? '作业' : '考试'}`, async () => {
+        const b = browser(webExamPage(webJudgeQuestion({ id: 'eid101', title: '' })), {
+            url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webExamXHRSetup({ url }), deferAI: true,
+        });
+        try {
+            await b.flush(); assert.equal(b.requests.length, 0, '未获取匹配题干时保持等待');
+            b.fixture.xhr.open('POST', url, true);
+            b.fixture.xhr.send('fixture-page-body');
+            b.fixture.xhr.emit(webExamResponse());
+            await b.tick();
+            assert.equal(b.requests.length, 1, '已匹配页面 eid/题型/选项后可以识别封闭题干');
+            assert.equal(b.control.app.inspectQuiz()[0].question, '一加一等于二。');
+            respond(b.requests[0]); await b.flush(); await b.flush();
+            assert.deepEqual(b.fixture.optionClicks, ['B']);
+            assert.deepEqual(b.fixture.saves, ['B']);
+            assert.equal(b.fixture.sent.length, 1, '只观察页面请求，不重放请求');
+        } finally { b.close(); }
+    });
+}
+
+for (const url of [webExamDataUrl, webHomeworkDataUrl]) {
+    test(`真实新考试页字符串成功状态读取并保存：${url.includes('doHomework') ? '作业' : '考试'}`, async () => {
+        const b = browser(webExamPage(webJudgeQuestion({ id: 'eid101', title: '' })), {
+            url: webExamUrl, settings: { apiKey: 'sk-test' }, deferAI: true,
+            setup(w) {
+                const fixture = webExamXHRSetup({ url })(w);
+                // 真实响应的选项 ID 为数字，空附件与子题可返回 null。
+                w.document.querySelectorAll('.nodeLab input').forEach((input, index) => { input.value = String(7001 + index); });
+                return fixture;
+            },
+        });
+        try {
+            const question = webExamQuestionData({
+                questionOptions: [{ id: 7001, content: '错' }, { id: 7002, content: '对' }],
+                questionDatas: null, questionChildrens: null,
+            });
+            const data = webExamResponse(question);
+            data.status = '200';
+            b.fixture.xhr.send('fixture-page-body');
+            b.fixture.xhr.emit(data, { responseType: url === webHomeworkDataUrl ? '' : 'json' });
+            await b.tick();
+            assert.equal(b.requests.length, 1, '字符串 200 应与数值 200 一样识别正常载题响应');
+            assert.equal(b.control.app.inspectQuiz()[0].question, '一加一等于二。');
+            respond(b.requests[0]); await b.flush(); await b.flush();
+            assert.deepEqual(b.fixture.optionClicks, ['B']);
+            assert.deepEqual(b.fixture.saves, ['B']);
+            assert.equal(b.fixture.submits, 0);
+            assert.equal(b.fixture.sent.length, 1, '不能重放正常载题请求');
+        } finally { b.close(); }
+    });
+}
+
+for (const status of ['401', '2000', true, '', null, 2000, '0200', ' 200 ', [200], { status: 200 }]) {
+    test(`真实新考试页拒绝非成功状态：${JSON.stringify(status)}`, async () => {
+        const b = browser(webExamPage(webJudgeQuestion({ id: 'eid101', title: '' })), {
+            url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webExamXHRSetup(), deferAI: true,
+        });
+        try {
+            const data = webExamResponse();
+            data.status = status;
+            b.fixture.xhr.send('fixture-page-body'); b.fixture.xhr.emit(data);
+            await b.tick();
+            assert.equal(b.requests.length, 0, '只能接受精确的数值或字符串 200');
+            assert.deepEqual(b.fixture.optionClicks, []);
+            assert.deepEqual(b.fixture.saves, []);
+        } finally { b.close(); }
+    });
+}
+
+for (const mismatch of ['题号', '选项id', '选项内容', '题型', '非白名单URL', '接口状态']) {
+    test(`真实新考试页 XHR ${mismatch}不匹配时不发题目请求`, async () => {
+        const b = browser(webExamPage(webJudgeQuestion({ id: 'eid101', title: '' })), {
+            url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webExamXHRSetup(), deferAI: true,
+        });
+        try {
+            const question = webExamQuestionData();
+            if (mismatch === '题号') question.eid = 'different-eid';
+            if (mismatch === '选项id') question.questionOptions[1].id = 'wrong-option';
+            if (mismatch === '选项内容') question.questionOptions[1].content = '错误内容';
+            if (mismatch === '题型') question.questionType = { id: 1, name: '单选题' };
+            const data = webExamResponse(question);
+            if (mismatch === '接口状态') data.status = 401;
+            b.fixture.xhr.send('fixture-page-body');
+            b.fixture.xhr.emit(data, { responseURL: mismatch === '非白名单URL' ? 'https://example.com/student/doExam' : webExamDataUrl });
+            await b.tick();
+            assert.equal(b.requests.length, 0);
+            assert.equal(b.fixture.optionClicks.length, 0);
+            assert.equal(b.fixture.saves.length, 0);
+        } finally { b.close(); }
+    });
+}
+
+test('真实新考试页同 eid 的 XHR 题干更新撤销旧模型响应', async () => {
+    const b = browser(webExamPage(webJudgeQuestion({ id: 'eid101', title: '' })), {
+        url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webExamXHRSetup(), deferAI: true,
+    });
+    try {
+        b.fixture.xhr.send('fixture-page-body'); b.fixture.xhr.emit(webExamResponse());
+        await b.tick(); assert.equal(b.requests.length, 1);
+        b.fixture.xhr.emit(webExamResponse(webExamQuestionData({ name: '<p>一加一等于三。</p>' })));
+        await b.tick();
+        respond(b.requests[0]); await b.flush(); await b.flush();
+        assert.equal(b.fixture.optionClicks.length, 0, '题干数据变化后不能写入旧答案');
+        await b.tick(); assert.equal(b.requests.length, 2);
+        assert.equal(b.control.app.inspectQuiz()[0].question, '一加一等于三。');
+        respond(b.requests[1], ['A']); await b.flush(); await b.flush();
+        assert.deepEqual(b.fixture.optionClicks, ['A']);
+    } finally { b.close(); }
+});
+
+test('真实新考试页字符串成功状态更新题干撤销旧模型响应', async () => {
+    const b = browser(webExamPage(webJudgeQuestion({ id: 'eid101', title: '' })), {
+        url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webExamXHRSetup(), deferAI: true,
+    });
+    try {
+        const initial = webExamResponse(); initial.status = '200';
+        b.fixture.xhr.send('fixture-page-body'); b.fixture.xhr.emit(initial);
+        await b.tick(); assert.equal(b.requests.length, 1);
+        const updated = webExamResponse(webExamQuestionData({ name: '<p>一加一等于三。</p>' })); updated.status = '200';
+        b.fixture.xhr.emit(updated);
+        await b.tick();
+        respond(b.requests[0]); await b.flush(); await b.flush();
+        assert.equal(b.fixture.optionClicks.length, 0, '字符串成功状态更新也必须撤销旧答案');
+        await b.tick(); assert.equal(b.requests.length, 2);
+        assert.equal(b.control.app.inspectQuiz()[0].question, '一加一等于三。');
+        respond(b.requests[1], ['A']); await b.flush(); await b.flush();
+        assert.deepEqual(b.fixture.optionClicks, ['A']);
+        assert.deepEqual(b.fixture.saves, ['A']);
+    } finally { b.close(); }
+});
+
+test('真实新考试页观察 XHR 保持 constructor/open/attachShadow 及 send 原参返回不变', async () => {
+    const b = browser(webExamPage(webJudgeQuestion({ id: 'eid101', title: '' })), {
+        url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webExamXHRSetup(), deferAI: true,
+    });
+    try {
+        const { xhr, original, sendResult } = b.fixture;
+        assert.equal(b.w.XMLHttpRequest, original.constructor);
+        assert.equal(b.w.XMLHttpRequest.prototype.open, original.open);
+        assert.equal(b.w.Element.prototype.attachShadow, original.attachShadow);
+        assert.ok(xhr instanceof original.constructor);
+        xhr.open('POST', webExamDataUrl, true);
+        const body = { fixture: 'original-page-body' }, extra = { fixture: 'extra-argument' };
+        assert.equal(xhr.send(body, extra), sendResult);
+        assert.equal(b.fixture.sent.length, 1);
+        assert.equal(b.fixture.sent[0].receiver, xhr);
+        assert.equal(b.fixture.sent[0].args[0], body);
+        assert.equal(b.fixture.sent[0].args[1], extra);
+        const data = webExamResponse(); xhr.emit(data);
+        const responseText = xhr.responseText;
+        await b.tick();
+        assert.equal(xhr.responseText, responseText);
+        assert.equal(xhr.response, responseText);
+        assert.equal(b.fixture.sent.length, 1);
+        assert.equal(b.requests.length, 1, '保留原生语义的同时成功观察响应');
+    } finally { b.close(); }
+});
+
+for (const mode of ['封闭题干', '可见题干']) {
+    test(`真实新考试页字体映射未解码时${mode}均暂停自动请求`, async () => {
+        const b = browser(webExamPage(webJudgeQuestion({ id: 'eid101', title: '' })), {
+            url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webExamXHRSetup(), deferAI: true,
+        });
+        try {
+            const data = webExamResponse();
+            data.rt.examBase.ttfUrl = 'https://image.zhihuishu.com/fixture-encrypted-font.ttf';
+            b.fixture.xhr.send('fixture-page-body'); b.fixture.xhr.emit(data);
+            if (mode === '可见题干') b.w.document.querySelector('.examPaper').innerHTML = webJudgeQuestion({ id: 'eid101', title: '画面呈现正常但底层字符可能被字体替换。' });
+            await b.tick();
+            assert.equal(b.requests.length, 0, '未确认字体映射不能把原始字符交给模型盲答');
+            assert.match(shadowOf(b).getElementById('activity').textContent, /字体|编码|人工|手动/);
+        } finally { b.close(); }
+    });
+}
+
+test('真实新考试页支持正常 XHR responseType=json 的题目响应', async () => {
+    const b = browser(webExamPage(webJudgeQuestion({ id: 'eid101', title: '' })), {
+        url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webExamXHRSetup(), deferAI: true,
+    });
+    try {
+        const data = webExamResponse();
+        b.fixture.xhr.send('fixture-page-body'); b.fixture.xhr.emit(data, { responseType: 'json' });
+        await b.tick();
+        assert.equal(b.requests.length, 1);
+        assert.equal(b.fixture.xhr.response, data, '不改写页面获取的原始 JSON 对象');
+        assert.equal(b.fixture.xhr.responseText, '');
+    } finally { b.close(); }
+});
+
+test('真实新考试页每份试卷响应替换缓存，不沿用上一份响应残留题目', async () => {
+    const b = browser(webExamPage(webJudgeQuestion({ id: 'eid101', title: '' })), {
+        url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webExamXHRSetup(), deferAI: true,
+    });
+    try {
+        b.fixture.xhr.send('fixture-page-body'); b.fixture.xhr.emit(webExamResponse());
+        await b.tick(); assert.equal(b.requests.length, 1);
+        b.fixture.xhr.emit(webExamResponse(webExamQuestionData({ eid: 'different-paper-eid' })));
+        await b.tick();
+        respond(b.requests[0]); await b.flush(); await b.tick();
+        assert.equal(b.fixture.optionClicks.length, 0, '新试卷不含当前题时旧响应必须失效');
+        assert.equal(b.requests.length, 1, '不得保留旧试卷题干并继续请求');
+    } finally { b.close(); }
+});
+
+test('其他考试域名不安装新考试页专用 XHR 监听', async () => {
+    const b = browser(webExamPage(webJudgeQuestion({ id: 'eid101', title: '' })), {
+        url: examUrl, settings: { apiKey: 'sk-test' }, setup: webExamXHRSetup(), deferAI: true,
+    });
+    try {
+        assert.equal(b.w.XMLHttpRequest.prototype.send, b.fixture.original.send, '精准域名与路由外保持 send 原函数');
+        assert.equal(b.w.XMLHttpRequest.prototype.open, b.fixture.original.open);
+    } finally { b.close(); }
+});
+
+test('真实新考试页成功的空试卷响应清除旧缓存并撤销旧题响应', async () => {
+    const b = browser(webExamPage(webJudgeQuestion({ id: 'eid101', title: '' })), {
+        url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webExamXHRSetup(), deferAI: true,
+    });
+    try {
+        b.fixture.xhr.send('fixture-page-body'); b.fixture.xhr.emit(webExamResponse());
+        await b.tick(); assert.equal(b.requests.length, 1);
+        b.fixture.xhr.emit({ status: 200, rt: { examBase: { workExamParts: [] } } });
+        await b.tick();
+        respond(b.requests[0]); await b.flush(); await b.tick();
+        assert.equal(b.fixture.optionClicks.length, 0, '成功空试卷不能继续使用旧缓存题干');
+        assert.equal(b.requests.length, 1);
+    } finally { b.close(); }
+});
+
+test('真实新考试页字符串成功的空试卷响应清除旧缓存并撤销旧题响应', async () => {
+    const b = browser(webExamPage(webJudgeQuestion({ id: 'eid101', title: '' })), {
+        url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webExamXHRSetup(), deferAI: true,
+    });
+    try {
+        const initial = webExamResponse(); initial.status = '200';
+        b.fixture.xhr.send('fixture-page-body'); b.fixture.xhr.emit(initial);
+        await b.tick(); assert.equal(b.requests.length, 1);
+        b.fixture.xhr.emit({ status: '200', rt: { examBase: { workExamParts: [] } } });
+        await b.tick();
+        respond(b.requests[0]); await b.flush(); await b.tick();
+        assert.equal(b.fixture.optionClicks.length, 0, '字符串成功空试卷不能继续使用旧缓存题干');
+        assert.equal(b.fixture.saves.length, 0);
+        assert.equal(b.control.app.inspectQuiz().length, 0, '成功空响应必须替换整个题目快照');
+        assert.equal(b.requests.length, 1);
+    } finally { b.close(); }
+});
+
+test('真实新考试页 eid 净化保留连字符并匹配公开 anchor 规则', async () => {
+    const b = browser(webExamPage(webJudgeQuestion({ id: 'eid-101', title: '' })), {
+        url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webExamXHRSetup(), deferAI: true,
+    });
+    try {
+        b.fixture.xhr.send('fixture-page-body');
+        b.fixture.xhr.emit(webExamResponse(webExamQuestionData({ eid: 'eid-101' })));
+        await b.tick();
+        assert.equal(b.requests.length, 1, '公开净化规则保留连字符，不能误删导致漏题');
+        respond(b.requests[0]); await b.flush(); await b.flush();
+        assert.deepEqual(b.fixture.optionClicks, ['B']);
+    } finally { b.close(); }
+});
+
+test('真实新考试页题目带附件时可见题干也不能漏附件请求', async () => {
+    const b = browser(webExamPage(webJudgeQuestion({ id: 'eid101', title: '' })), {
+        url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webExamXHRSetup(), deferAI: true,
+    });
+    try {
+        b.fixture.xhr.send('fixture-page-body');
+        b.fixture.xhr.emit(webExamResponse(webExamQuestionData({ questionDatas: [{ suffix: 'png', url: 'https://image.zhihuishu.com/fixture-attachment.png' }] })));
+        b.w.document.querySelector('.examPaper').innerHTML = webJudgeQuestion({ id: 'eid101', title: '请结合本题附件判断。' });
+        await b.tick();
+        assert.equal(b.requests.length, 0, '附件未完整接入时不能回退为缺附件文字题');
+        assert.equal(b.fixture.optionClicks.length, 0);
+        assert.equal(b.fixture.saves.length, 0);
+    } finally { b.close(); }
+});
+
+test('真实新考试页缓存含 questionChildrens 时不把复杂填空当作单题保存', async () => {
+    const question = webJudgeQuestion({ id: 'eid101', title: '' }).replace('【判断题】', '【填空题】')
+        .replace(/<div class="subject_node">[\s\S]*?<\/div>\s*<\/div>$/, '<div class="subject_node"><textarea></textarea></div></div>');
+    const b = browser(webExamPage(question), {
+        url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webExamXHRSetup(), deferAI: true,
+    });
+    try {
+        const data = webExamQuestionData({ questionType: { id: 3, name: '填空题' }, name: '请根据各小题要求填写。',
+            questionOptions: [], questionChildrens: [{ eid: 'child1', name: '水的化学式是什么？' }, { eid: 'child2', name: '氧气的化学式是什么？' }] });
+        b.fixture.xhr.send('fixture-page-body'); b.fixture.xhr.emit(webExamResponse(data));
+        await b.tick();
+        assert.equal(b.requests.length, 0, '子题未适配时不能只回答父题干');
+        assert.deepEqual(Array.from(b.w.document.querySelectorAll('textarea')).map(field => field.value), ['']);
+        assert.equal(b.fixture.saves.length, 0);
+        assert.match(shadowOf(b).getElementById('activity').textContent, /子题|复杂.*(?:手动|人工)/);
+    } finally { b.close(); }
+});
+
+for (const childCount of [1, 2]) {
+    test(`真实新考试页 ${childCount} 个编号子题需人工，禁止仅填写父题干后保存`, async () => {
+        // 公开 render859：每个子题为外 div > .subject_node.mt10 > div，直接 [n] 文本 + span + textarea。
+        const children = Array.from({ length: childCount }, (_, index) => `<div><div class="subject_node mt10"><div>
+            [${index + 1}]
+            <span>${index ? '氧气的化学式是____。' : '水的化学式是____。'}</span><br><textarea class="text_textarea" rows="3"></textarea>
+        </div></div></div>`).join('');
+        const question = webJudgeQuestion({ id: 'eid101', title: '请完成下列各小题。' }).replace('【判断题】', '【填空题】')
+            .replace(/<div class="subject_node">[\s\S]*?<\/div>\s*<\/div>$/, `${children}</div>`);
+        const b = browser(webExamPage(question), {
+            url: webExamUrl, settings: { apiKey: 'sk-test' }, setup: webJudgeSetup(), deferAI: true,
+        });
+        try {
+            await b.flush(); await b.tick();
+            assert.equal(b.requests.length, 0, '编号小题结构不能降级为仅父题干或首空');
+            assert.deepEqual(Array.from(b.w.document.querySelectorAll('textarea')).map(field => field.value), Array(childCount).fill(''));
+            assert.equal(b.fixture.saves.length, 0);
+            assert.match(shadowOf(b).getElementById('activity').textContent, /子题|复杂.*(?:手动|人工)/);
         } finally { b.close(); }
     });
 }

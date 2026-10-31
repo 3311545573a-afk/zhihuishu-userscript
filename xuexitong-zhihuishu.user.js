@@ -1,13 +1,20 @@
 // ==UserScript==
 // @name         学习通 / 智慧树学习助手（适配版）
 // @namespace    github.aajddjkfkfke.xuexitong
-// @version      1.1.2
-// @description  保留学习通功能，支持智慧树共享课视频、连播及文字/公式图片弹题；右侧面板控制，无需本地服务
+// @version      1.2.2
+// @description  保留学习通功能，支持智慧树共享课视频、连播及文字/公式图片弹题，并支持智慧树作业/考试页识别题目与自动作答；右侧面板控制，无需本地服务
 // @author       aajddjkfkfke
 // @match        *://*.chaoxing.com/mycourse/studentstudy*
 // @match        *://*.chaoxing.com/mooc2-ans/mycourse/studentstudy*
 // @match        https://studyvideoh5.zhihuishu.com/stuStudy*
-// @run-at       document-idle
+// @match        *://examh5.zhihuishu.com/*
+// @match        *://exampc.zhihuishu.com/*
+// @match        *://exam.zhihuishu.com/*
+// @match        *://*.zhihuishu.com/*exam*
+// @match        *://*.zhihuishu.com/*homework*
+// @match        *://*.zhihuishu.com/*paper*
+// @match        *://*.zhihuishu.com/*
+// @run-at       document-start
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
@@ -19,7 +26,7 @@
 
 /*
  * 安装：Tampermonkey → 新建脚本 → 全选本文件内容粘贴 → 保存；或直接把本文件拖进浏览器。
- * 使用：打开学习通课程播放页或智慧树共享课 /stuStudy 播放页；视频功能无需 API Key。
+ * 使用：打开学习通课程播放页、智慧树共享课 /stuStudy 播放页，或智慧树作业/考试页；视频功能无需 API Key。
  * 倍速：学习通可选 1.0–3.0x；智慧树最高 1.8x（默认“跟随页面”），对当前及后续视频生效。
  * 隐私：API Key 优先保存到油猴存储，无油猴时回退页面 localStorage；面板中以密码框显示。
  * 开启 AI 答题会把题干与选项（含图片）发送至 api.deepseek.com；学习通分支另可能加载 jQuery 和网页字体。
@@ -30,9 +37,17 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.1.2';
-    const IS_ZHIHUI = location.hostname === 'studyvideoh5.zhihuishu.com' && /^\/stuStudy(?:\/|$)/.test(location.pathname);
-    const PLATFORM_NAME = IS_ZHIHUI ? '智慧树共享课' : '学习通';
+    const VERSION = '1.2.2';
+    const HOST_NAME = String(location.hostname || '');
+    const IS_ZHIHUI = HOST_NAME === 'studyvideoh5.zhihuishu.com' && /^\/stuStudy(?:\/|$)/.test(location.pathname);
+    // 智慧树作业/考试页：examh5、exampc 等独立域，或长域名里带 exam/homework/paper 路径。
+    // 共享课播放页优先，避免 /stuStudy 被误判成作业页。
+    const IS_ZH_QUIZ = !IS_ZHIHUI && /(^|\.)zhihuishu\.com$/i.test(HOST_NAME) &&
+        (/^(?:examh5|exampc|exam|exampaper)\./i.test(HOST_NAME) ||
+            /exam|homework|zuoye|paper|testpaper/i.test(location.pathname + location.hash));
+    const ZHIHUI_RATE_LIMIT = 1.8;
+    const IS_CHAOXING = /(^|\.)chaoxing\.com$/i.test(HOST_NAME);
+    const PLATFORM_NAME = IS_ZHIHUI ? '智慧树共享课' : IS_ZH_QUIZ ? '智慧树作业/考试' : '学习通';
     const BOOT_KEY = '__xuexitongDeepSeekPanelBooted';
     const API_URL = 'https://api.deepseek.com/chat/completions';
     const MODELS_URL = 'https://api.deepseek.com/models';
@@ -40,6 +55,88 @@
 
     if (window[BOOT_KEY]) return;
     window[BOOT_KEY] = true;
+
+    // @match 里为兼容未知的作业/考试路由放开了 *.zhihuishu.com；
+    // 其余页面（如学堂首页、非考试类学习页）直接退出，不注入面板。
+    if (!IS_ZHIHUI && !IS_ZH_QUIZ && !IS_CHAOXING) return;
+
+    const IS_ZH_NEW_EXAM = HOST_NAME === 'onlineexamh5new.zhihuishu.com' && location.pathname === '/stuExamWeb.html';
+    let webExamQuestionData = new Map();
+    let webExamUsesEncodedFont = false;
+
+    function webExamResponseAllowed(value) {
+        try {
+            const url = new URL(value);
+            return url.protocol === 'https:' && !url.username && !url.password && !url.port &&
+                ((url.hostname === 'studentexam-api.zhihuishu.com' && url.pathname === '/studentExam/gateway/t/v1/student/doHomework') ||
+                 (url.hostname === 'taurusexam-api.zhihuishu.com' && url.pathname === '/taurusExam/gateway/t/v1/student/doExam'));
+        } catch (error) {
+            return false;
+        }
+    }
+
+    function observeWebExamResponse(xhr) {
+        try {
+            if (xhr.status !== 200 || !webExamResponseAllowed(xhr.responseURL)) return;
+            const payload = xhr.responseType === 'json' ? xhr.response :
+                (!xhr.responseType || xhr.responseType === 'text') ? JSON.parse(xhr.responseText) : null;
+            const parts = payload?.rt?.examBase?.workExamParts;
+            // 实页业务状态可能为字符串 "200"；仅接受这两种成功值，不宽松转换其他值。
+            if ((payload?.status !== 200 && payload?.status !== '200') || !Array.isArray(parts)) return;
+            const questions = new Map();
+            const duplicates = new Set();
+            for (const part of parts) {
+                for (const question of Array.isArray(part?.questionDtos) ? part.questionDtos : []) {
+                    if (!question || typeof question.eid !== 'string' || !question.eid || typeof question.name !== 'string') continue;
+                    const eid = question.eid;
+                    if (questions.has(eid) || duplicates.has(eid)) {
+                        duplicates.add(eid);
+                        questions.delete(eid);
+                        continue;
+                    }
+                    // 只保留题目内容；账号、会话和完整响应不进入缓存，不写本地存储。
+                    questions.set(eid, {
+                        eid, name: question.name,
+                        questionType: { id: Number(question.questionType?.id), name: String(question.questionType?.name || '') },
+                        questionOptions: Array.isArray(question.questionOptions) ? question.questionOptions.map((option) => ({ id: String(option?.id ?? ''), content: typeof option?.content === 'string' ? option.content : '' })) : [],
+                        hasAttachments: Array.isArray(question.questionDatas) && question.questionDatas.length > 0,
+                        hasChildren: Array.isArray(question.questionChildrens) && question.questionChildrens.length > 0,
+                    });
+                }
+            }
+            webExamQuestionData = questions;
+            webExamUsesEncodedFont = typeof payload.rt.examBase.ttfUrl === 'string' && Boolean(payload.rt.examBase.ttfUrl.trim());
+        } catch (error) {
+            // 非题目响应、无效 JSON 和跨域访问异常不影响网页自己的请求处理。
+        }
+    }
+
+    if (IS_ZH_NEW_EXAM) {
+        try {
+            const target = typeof unsafeWindow !== 'undefined' && unsafeWindow ? unsafeWindow : window;
+            const prototype = target.XMLHttpRequest?.prototype;
+            const original = prototype?.send;
+            const descriptor = prototype && Object.getOwnPropertyDescriptor(prototype, 'send');
+            const observed = new WeakSet();
+            if (typeof original === 'function' && descriptor) {
+                Object.defineProperty(prototype, 'send', { ...descriptor, value: function (...args) {
+                    try {
+                        if (!observed.has(this)) {
+                            this.addEventListener('load', () => observeWebExamResponse(this));
+                            observed.add(this);
+                        }
+                    } catch (error) { /* 监听不可用时仍按原参数发送。 */ }
+                    return Reflect.apply(original, this, args);
+                } });
+            }
+        } catch (error) { /* 页面不允许安装观察器时保留人工处理。 */ }
+    }
+
+    // document-start 先观察网页原有题目响应；面板及播放器等待 body 可用后初始化。
+    let initialized = false;
+    function initialize() {
+    if (initialized || !document.body) return;
+    initialized = true;
 
     /* ---------------------------------------------------------------- 设置 */
 
@@ -70,6 +167,7 @@
         apiKey: String(storage.get('apiKey', '') || ''),
         autoQuiz: storage.get('autoQuiz', true) !== false,
         autoNext: storage.get('autoNext', true) !== false,
+        autoSubmit: storage.get('autoSubmit', false) === true,
         rate: Number(storage.get('rate', 0)) || 0,
         lockRate: storage.get('lockRate', true) !== false,
         position: storage.get('position', null),
@@ -80,6 +178,7 @@
         app: null,
         mode: 'idle', // idle | waiting | running | error
         activity: '',
+        scriptWarning: '', // 平台明确提示异常脚本后，本页不再重启自动化。
     };
 
     // 页面 jQuery 可能位于沙箱之外（Firefox + Tampermonkey 的 Xray 环境），优先取页面 window。
@@ -167,8 +266,8 @@
     }
 
     function applyPlaybackRate(video) {
-        // 共享课播放器自身以 1.8x 为上限，超过会触发异常提示。
-        const rate = IS_ZHIHUI ? Math.min(1.8, Number(settings.rate) || 0) : Number(settings.rate) || 0;
+        // 页面 onTime 会把实际倍速大于 1.8 判为异常脚本，保持在页面允许范围内。
+        const rate = IS_ZHIHUI ? Math.min(ZHIHUI_RATE_LIMIT, Number(settings.rate) || 0) : Number(settings.rate) || 0;
         if (!video || rate <= 0) return;
         video.__xtRateTarget = rate;
         if (settings.lockRate) installRateLock(video);
@@ -291,12 +390,13 @@
         return false;
     }
 
-    const SYSTEM_PROMPT = '按题意回答全部题目。注意：题干或选项可能经过网页防复制处理，出现整句汉字被替换成部首不同、语义不通的字（例如把“中国特色社会主义”写成“中国悺悷社会主悴”），也可能夹杂无关字。请先利用固定搭配、课程术语和选项反推原句，再按还原后的题意作答；不要把替换字当作专业术语，也不要因无法逐字还原而放弃。每题通常带 theme 字段，表示选项共同后缀（如“铁路”“主义”）；restored 必须包含 theme，题干主题也必须与 theme 一致，若可读字与 theme 冲突，以 theme 为准（例如 theme 为“铁路”、可读字含“电气”时，应还原成“电气化铁路”，不应写成电子计算机）。每题都必须给非空答案，只用该题提供的选项字母且不可重复；单选和判断选一个，多选列出所有正确项。不确定时选最可能的答案。answers 每项除 id、letters 外，再加 restored 字段，写入你还原后的题干（不超过50字）。只输出JSON：{"answers":[{"id":1,"letters":["A"],"restored":"还原后的题干"}]}。';
+    const SYSTEM_PROMPT = '按题意回答全部题目。注意：题干或选项可能经过网页防复制处理，出现整句汉字被替换成部首不同、语义不通的字（例如把“中国特色社会主义”写成“中国悺悷社会主悴”），也可能夹杂无关字。请先利用固定搭配、课程术语和选项反推原句，再按还原后的题意作答；不要把替换字当作专业术语，也不要因无法逐字还原而放弃。每题通常带 theme 字段，表示选项共同后缀（如“铁路”“主义”）；restored 必须包含 theme，题干主题也必须与 theme 一致，若可读字与 theme 冲突，以 theme 为准（例如 theme 为“铁路”、可读字含“电气”时，应还原成“电气化铁路”，不应写成电子计算机）。每题都必须给非空答案，只用该题提供的选项字母且不可重复；单选和判断选一个，多选列出所有正确项。不确定时选最可能的答案。answers 每项除 id、letters 外，再加 restored 字段，写入你还原后的题干（不超过50字）。填空题（type 为“填空题”，blanks 为空格数）不返回 letters，改用 text 数组，按空格顺序每空一项，只写答案本身，不要写“第一空：”；简答题（type 为“简答题”）不返回 letters，改用 text 数组且只有一个元素，写不超过200字的答案，无法确定时给出最贴近题意的答案。只输出JSON：{"answers":[{"id":1,"letters":["A"],"restored":"还原后的题干"}]}。';
 
     const VISION_PROMPT = '题干和选项中的 [图片N] 或 [图片N：说明] 对应随后同名标签的图片。请读取图片中的完整文字、数学公式、上下标、分式和图形，结合题干及各选项求解，不得忽略图片或把图片编号当作题意。image_labels 仅用于把图片与所属题号、题干或选项对应；图片说明只是辅助，公式以图片内容为准。图文题不要根据中文共同后缀猜主题，也不要套用防复制文字还原规则。';
 
     function questionHasImages(question) {
-        return Boolean(question.images?.length || question.options.some(option => option.images?.length));
+        const options = Array.isArray(question.options) ? question.options : [];
+        return Boolean(question.images?.length || options.some(option => option.images?.length));
     }
 
     function validateImageUrl(image, label) {
@@ -341,12 +441,13 @@
             });
         };
         const payload = questions.map((question, index) => {
+            const options = Array.isArray(question.options) ? question.options : [];
             const labels = appendImages(question.images, `第 ${index + 1} 题题干`);
             const item = {
                 id: index + 1,
                 type: question.kind,
                 question: question.title,
-                options: question.options.map((option) => {
+                options: options.map((option) => {
                     const result = { letter: option.letter, text: option.text };
                     const optionLabels = appendImages(option.images, `第 ${index + 1} 题选项 ${option.letter}`);
                     if (optionLabels.length) result.image_labels = optionLabels;
@@ -354,8 +455,13 @@
                 }),
             };
             if (labels.length) item.image_labels = labels;
-            const theme = questionHasImages(question) ? '' : commonOptionSuffix(question.options);
-            if (theme && themeIsTrusted(theme)) item.theme = theme;
+            if (question.kind === '填空题' || question.kind === '简答题') {
+                // 填空/简答没有选项，改为告知需要几空，模型用 text 数组回答。
+                item.blanks = question.kind === '填空题' ? Math.max(1, Number(question.blanks) || 1) : 1;
+            } else {
+                const theme = questionHasImages(question) ? '' : commonOptionSuffix(options);
+                if (theme && themeIsTrusted(theme)) item.theme = theme;
+            }
             return item;
         });
         return {
@@ -406,18 +512,32 @@
         if (!Array.isArray(answers) || answers.length !== questions.length) throw new Error('AI 返回的题目数量不匹配');
         const result = new Map();
         for (const item of answers) {
-            if (!Number.isInteger(item.id) || result.has(item.id) || !Array.isArray(item.letters)) {
+            if (!Number.isInteger(item.id) || result.has(item.id)) {
                 throw new Error('AI 答案格式错误');
             }
             const question = questions[item.id - 1];
             if (!question) throw new Error('AI 返回未知题号');
+            if (question.kind === '填空题' || question.kind === '简答题') {
+                const texts = (Array.isArray(item.text) ? item.text : [item.text]).map((value) => clean(value));
+                if (!texts.length || texts.some((value) => !value)) throw new Error(`第 ${item.id} 题 AI 未给出文字答案，已停止填写`);
+                if (question.kind === '填空题' && Number(question.blanks) > 0 && texts.length !== Number(question.blanks)) {
+                    throw new Error(`第 ${item.id} 题有 ${question.blanks} 个空，AI 返回 ${texts.length} 段答案，已停止填写`);
+                }
+                if (question.kind === '简答题' && texts.length !== 1) {
+                    throw new Error(`第 ${item.id} 题是简答题，AI 返回了 ${texts.length} 段答案，已停止填写`);
+                }
+                result.set(item.id, texts);
+                continue;
+            }
+            if (!Array.isArray(item.letters)) throw new Error('AI 答案格式错误');
+            const options = Array.isArray(question.options) ? question.options : [];
             const letters = item.letters.map((letter) => clean(letter).toUpperCase());
             if (!letters.length) throw new Error(`第 ${item.id} 题 AI 未给出选项，已停止提交`);
             if (new Set(letters).size !== letters.length) throw new Error(`第 ${item.id} 题答案包含重复选项，已停止提交`);
             if (question.kind !== '多选题' && letters.length !== 1) {
                 throw new Error(`第 ${item.id} 题是${question.kind}，但 AI 返回了 ${letters.length} 个选项，已停止提交`);
             }
-            const invalid = letters.filter((letter) => !question.options.some((option) => option.letter === letter));
+            const invalid = letters.filter((letter) => !options.some((option) => option.letter === letter));
             if (invalid.length) {
                 throw new Error(`第 ${item.id} 题 AI 返回了页面中不存在的选项：${invalid.join('、')}，已停止提交`);
             }
@@ -777,7 +897,7 @@
         let lastProblem = '';
         for (let attempt = 1; attempt <= 2; attempt++) {
             if (!isCurrent()) throw new Error('题目上下文已变化，请求已取消');
-            const imageCount = questions.reduce((count, q) => count + (q.images?.length || 0) + q.options.reduce((sum, o) => sum + (o.images?.length || 0), 0), 0);
+            const imageCount = questions.reduce((count, q) => count + (q.images?.length || 0) + (Array.isArray(q.options) ? q.options.reduce((sum, o) => sum + (o.images?.length || 0), 0) : 0), 0);
             setActivity(`${attempt === 1 ? '正在请求' : '正在重试'} DeepSeek${imageCount ? `（图文识别 ${imageCount} 张图片）` : ''}…`);
             const response = await gmRequest({
                 method: 'POST',
@@ -1563,11 +1683,12 @@
             .filter((root, index, roots) => zhVisible(root) && !roots.some((other, i) => i !== index && other.contains(root)));
     }
 
-    function zhRichContent(element) {
+    function zhRichContent(element, baseDocument = null) {
         const images = [];
-        const doc = element?.ownerDocument || document;
+        const doc = baseDocument || element?.ownerDocument || document;
         const read = node => {
             if (node.nodeType === 3) return node.nodeValue || '';
+            if (node.nodeType === 11) return Array.from(node.childNodes).map(read).join('');
             if (node.nodeType !== 1) return '';
             const tag = node.tagName.toLowerCase();
             if (['script', 'style', 'noscript'].includes(tag)) return '';
@@ -1728,6 +1849,9 @@
 
     function zhBlockingReason() {
         for (const doc of zhDocuments()) {
+            const scriptWarning = Array.from(doc.querySelectorAll('[role="dialog"],[aria-modal="true"],.el-dialog__wrapper,.el-message-box__wrapper,.dialog-aberrant,.dialog .aberrant'))
+                .some(element => zhVisible(element) && /检测到异常脚本/.test(zhText(element)));
+            if (scriptWarning) return '检测到异常脚本：请停用此脚本，回到学堂重新进入视频页';
             // SDK 空容器本身不是验证界面，仅检测真正显示的验证码 iframe。
             if (Array.from(doc.querySelectorAll('iframe#tcaptcha_iframe_dy,iframe[src*="captcha"],iframe[id^="tcaptcha_"]')).some(zhCaptchaVisible)) {
                 return '请在网页上完成人工验证';
@@ -1908,6 +2032,10 @@
                     const directory = this._syncDirectory();
                     const blocked = zhBlockingReason();
                     if (blocked) {
+                        if (blocked.startsWith('检测到异常脚本')) {
+                            stopForScriptWarning(blocked);
+                            return;
+                        }
                         this._quizToken = null;
                         if (!this._blockedReason) this._resumeAfterBlock = Boolean(video && (!video.paused || this._wantPlay));
                         if (blocked !== this._blockedReason) log('warn', blocked);
@@ -2153,6 +2281,959 @@
                 this._pending = null;
                 this._unbindVideo();
                 this._videoEl = null;
+            },
+        };
+        return app;
+    }
+
+    /* ---------------------------------------------- 智慧树作业 / 考试页适配 */
+    // 依据：考试页前端使用 Element UI（el-radio / el-checkbox 分组）与题型 1-5。
+    // 这里不假设唯一类名：Element UI 分组、原生 input、多文档（iframe）三层兜底。
+
+    const QUIZ_GROUP_SELECTOR = '.el-radio-group,.el-checkbox-group';
+    const QUIZ_KIND_PATTERN = /(单选题|多选题|判断题|填空题|简答题)/;
+    const QUIZ_SUBMIT_LABELS = ['交卷', '提交试卷', '提交作业', '提交答案', '保存并交卷', '保存并提交', '提交'];
+    const QUIZ_NEXT_LABELS = ['下一题', '下一页', '下一步'];
+    const QUIZ_LETTER_PREFIX = /^([A-Ha-h])\s*[.、．:：)）]\s*/;
+    const quizNodeIds = new WeakMap();
+    let quizNodeSequence = 0;
+
+    function quizNodeId(node) {
+        if (!node) return 0;
+        if (!quizNodeIds.has(node)) quizNodeIds.set(node, ++quizNodeSequence);
+        return quizNodeIds.get(node);
+    }
+
+    function quizTextOf(element) {
+        return zhText(element);
+    }
+
+    function quizGroups(doc) {
+        const groups = [];
+        for (const element of doc.querySelectorAll(QUIZ_GROUP_SELECTOR)) {
+            if (!zhVisible(element) || groups.includes(element)) continue;
+            groups.push(element);
+        }
+        if (groups.length) return groups;
+        // 非 Element UI：把同名 input 的最近公共祖先当成一个分组。
+        const byName = new Map();
+        for (const input of doc.querySelectorAll('input[type="radio"],input[type="checkbox"]')) {
+            if (!zhVisible(input) || input.closest('.el-radio,.el-checkbox')) continue;
+            const key = String(input.name || '') || `__single_${groups.length}`;
+            if (!byName.has(key)) byName.set(key, []);
+            byName.get(key).push(input);
+        }
+        for (const inputs of byName.values()) {
+            if (inputs.length < 2) continue;
+            let scope = inputs[0].parentElement;
+            while (scope && scope !== doc.body && !inputs.every((input) => scope.contains(input))) scope = scope.parentElement;
+            if (scope && !groups.includes(scope)) groups.push(scope);
+        }
+        return groups;
+    }
+
+    function quizOptionChecked(option) {
+        // 新考试页隐藏 input 的 v-model 保存题号，真实选中状态由正文/字母的类表示。
+        if (option.webExam) return Boolean(option.element.querySelector('.mr10.onChecked,.node_detail.onChecked'));
+        if (option.input) return option.input.checked === true;
+        return /(^|\s)is-checked(\s|$)/.test(String(option.element.className || '')) ||
+            option.element.getAttribute('aria-checked') === 'true';
+    }
+
+    function quizOptions(group) {
+        const rows = [];
+        const read = (holder, input) => {
+            const labelNode = holder.querySelector('.el-radio__label,.el-checkbox__label');
+            const content = zhRichContent(labelNode || holder);
+            const raw = content.text;
+            const value = clean(input?.value || '');
+            const prefix = raw.match(QUIZ_LETTER_PREFIX);
+            let letter = /^[A-Ha-h]$/.test(value) ? value.toUpperCase() : prefix ? prefix[1].toUpperCase() : '';
+            const text = clean(raw.replace(QUIZ_LETTER_PREFIX, ''));
+            return { letter, text, images: content.images, element: holder, input };
+        };
+        const labels = Array.from(group.querySelectorAll('.el-radio,.el-checkbox')).filter(zhVisible);
+        if (labels.length) {
+            for (const holder of labels) {
+                const row = read(holder, holder.querySelector('input'));
+                if (row.text) rows.push(row);
+            }
+        } else {
+            for (const input of group.querySelectorAll('input[type="radio"],input[type="checkbox"]')) {
+                if (!zhVisible(input)) continue;
+                const holder = input.closest('label') || input.parentElement;
+                if (!holder) continue;
+                const row = read(holder, input);
+                if (row.text) rows.push(row);
+            }
+        }
+        // 无字母选项按网页顺序编号，不能先排序后补字母而改变图片归属。
+        rows.forEach((row, index) => { if (!row.letter) row.letter = String.fromCharCode(65 + index); });
+        return rows;
+    }
+
+    function quizContainer(group) {
+        let best = group;
+        for (let node = group.parentElement; node && node !== node.ownerDocument.body; node = node.parentElement) {
+            if (node.querySelectorAll(QUIZ_GROUP_SELECTOR).length > 1) break;
+            const nativeNames = new Set(Array.from(node.querySelectorAll('input[type="radio"],input[type="checkbox"]')).map((input) => input.name).filter(Boolean));
+            if (nativeNames.size > 1) break;
+            const text = quizTitle(node).raw;
+            if (text.length > 1500) break;
+            best = node;
+            if (QUIZ_KIND_PATTERN.test(text) || /^\s*(?:第\s*)?\d+\s*(?:题|[.、．:：)）])/.test(text) ||
+                node.matches('.question-item,.questionLi,.TiMu,.subject-item,[data-question-id]')) break;
+        }
+        return best;
+    }
+
+    function quizTitle(container) {
+        const clone = container.cloneNode(true);
+        clone.querySelectorAll('input[type="radio"],input[type="checkbox"]').forEach((input) => {
+            const holder = input.closest('label') || input.parentElement;
+            if (holder !== clone) holder?.remove();
+        });
+        clone.querySelectorAll(`${QUIZ_GROUP_SELECTOR},.el-radio,.el-checkbox,input,textarea,[contenteditable],button,select,.el-button`).forEach((node) => node.remove());
+        const content = zhRichContent(clone);
+        const raw = content.text;
+        const kind = raw.match(QUIZ_KIND_PATTERN)?.[1] || '';
+        const title = clean(raw.replace(QUIZ_KIND_PATTERN, ' ')
+            .replace(/^\s*(?:第\s*)?\d+\s*(?:题|[.、．)）])\s*/, ' ')
+            .replace(/^\s*[（(]\s*[)）]\s*/, ' '));
+        return { kind, title, images: content.images, raw };
+    }
+
+    function quizIsEditable(field) {
+        return field?.isContentEditable || field?.getAttribute('contenteditable') === 'true';
+    }
+
+    function quizFieldValue(field) {
+        if (!field) return '';
+        if (quizIsEditable(field)) return clean(field.textContent);
+        return clean(field.value);
+    }
+
+    function quizIsFillField(node) {
+        if (!node || !zhVisible(node)) return false;
+        if (node.getAttribute('contenteditable') === 'true') return !node.closest('.el-radio,.el-checkbox');
+        const tag = String(node.tagName || '').toUpperCase();
+        if (tag !== 'INPUT' && tag !== 'TEXTAREA') return false;
+        if (node.disabled || node.readOnly) return false;
+        if (/^(?:radio|checkbox|hidden|button|submit|reset|file|image)$/i.test(String(node.type || node.getAttribute('type') || ''))) return false;
+        return !node.closest('.el-radio,.el-checkbox');
+    }
+
+    function quizFillFields(container) {
+        // Element UI 的文本框本身可能就带 el-input__inner / el-textarea__inner，
+        // 不能按类名排除；富文本简答题用 contenteditable 承载。
+        return Array.from(container.querySelectorAll('textarea,input,[contenteditable="true"]')).filter(quizIsFillField);
+    }
+
+    function quizKindOf(container, titleKind, options, fields) {
+        if (titleKind) return titleKind;
+        if (fields.length) {
+            const text = quizTitle(container).raw;
+            if (fields.some((field) => field.tagName === 'TEXTAREA' || quizIsEditable(field)) || /简答|论述|分析|问答/.test(text)) return '简答题';
+            return '填空题';
+        }
+        if (options.length >= 2) {
+            const checkbox = options.some((option) => option.input?.type === 'checkbox' ||
+                /(^|\s)el-checkbox(\s|$)/.test(String(option.element.className || '')));
+            if (checkbox) return '多选题';
+            const texts = options.map((option) => clean(option.text));
+            if (texts.length === 2 && texts.every((text) => /^(正确|对|是|错误|错|否|√|×|T|F)$/i.test(text))) return '判断题';
+            return '单选题';
+        }
+        return '';
+    }
+
+    // 填空题/简答题没有 el-radio-group，只能从输入框向上定位题目容器。
+    // 判定必须保守：题型/题号要出现在容器自身文本里，且容器不能横跨多道题，
+    // 结构不明确时宁可漏答（交给人工），也不能把整页合并成一道题写错答案。
+    const QUIZ_KIND_ALL = new RegExp(QUIZ_KIND_PATTERN.source, 'g');
+    const QUIZ_NUMBER_ALL = /(?:^|[\s（(])\s*(?:第\s*)?\d{1,3}\s*(?:题|[.、．:：)）])/g;
+
+    // 把“只包住一个输入框”的包装层合并掉，得到每个输入框所在的题块。
+    function quizFillBlocks(root) {
+        const blocks = [];
+        for (const field of quizFillFields(root)) {
+            let block = field;
+            while (block.parentElement && block.parentElement !== root && quizFillFields(block.parentElement).length === 1) {
+                block = block.parentElement;
+                if (clean(zhText(block)).length > 300) break;
+            }
+            if (!blocks.includes(block)) blocks.push(block);
+        }
+        return blocks;
+    }
+
+    function quizFillContainer(field, doc) {
+        for (let node = field.parentElement, depth = 0; node && node !== doc.body && depth < 6; node = node.parentElement, depth++) {
+            if (node.querySelectorAll(QUIZ_GROUP_SELECTOR).length) return null;
+            const raw = quizTitle(node).raw;
+            if (raw.length > 300) return null; // 再往上只会把整页或答题卡合进来
+            const fields = quizFillFields(node);
+            if (fields.length > 8) return null; // 输入框过多，疑似答题卡/整页
+            // 多个题块各自带题干，说明这个容器横跨了多道题：宁可漏答。
+            const blocks = quizFillBlocks(node);
+            if (blocks.length > 1 && blocks.some((block) => clean(quizTitle(block).title).length > 2)) return null;
+            const { kind, title } = quizTitle(node);
+            if (!title) continue;
+            const kindCount = (raw.match(QUIZ_KIND_ALL) || []).length;
+            const numberCount = (raw.match(QUIZ_NUMBER_ALL) || []).length;
+            if (kindCount > 1 || numberCount > 1) return null;
+            // 题型文字必须靠近题干开头，避免命中页头“题型包括单选题、填空题”。
+            if (kind && raw.indexOf(kind) >= 0 && raw.indexOf(kind) <= 24) return node;
+            if (!kind && /^\s*(?:第\s*)?\d{1,3}\s*(?:题|[.、．:：)）])/.test(raw)) return node;
+        }
+        return null;
+    }
+
+    function quizFillContainers(doc) {
+        const containers = [];
+        for (const field of doc.querySelectorAll('textarea,input,[contenteditable="true"]')) {
+            if (field.closest('.examPaper_subject')) continue;
+            if (!quizIsFillField(field)) continue;
+            const container = quizFillContainer(field, doc);
+            if (container && !containers.includes(container)) containers.push(container);
+        }
+        return containers;
+    }
+
+    function quizWebRoots() {
+        return courseDocuments().flatMap((doc) => Array.from(doc.querySelectorAll('.examPaper_subject')).filter(zhVisible));
+    }
+
+    function quizWebHtmlContent(html, doc) {
+        const template = doc.createElement('template');
+        template.innerHTML = html;
+        return zhRichContent(template.content, doc);
+    }
+
+    function quizWebKind(type) {
+        return String(type || '').match(QUIZ_KIND_PATTERN)?.[1] || (/问答|论述|分析题/.test(String(type || '')) ? '简答题' : '');
+    }
+
+    function quizWebCachedEntry(container) {
+        if (!IS_ZH_NEW_EXAM) return null;
+        const anchor = container.querySelector('.subject_num [id^="anchor_"]');
+        if (!anchor) return null;
+        const candidates = Array.from(webExamQuestionData.values()).filter((question) =>
+            `anchor_${question.eid.replace(/[\\/?*"'<>{}\[\]:^$!~`=+]/g, '')}` === anchor.id);
+        return candidates.length === 1 ? candidates[0] : null;
+    }
+
+    function quizWebCachedQuestion(container, kind, options, visibleContent) {
+        const question = quizWebCachedEntry(container);
+        if (!question) return null;
+        const knownType = { 1: '单选题', 2: '多选题', 14: '判断题', 3: '填空题', 4: '简答题', 6: '简答题', 13: '简答题' }[Number(question.questionType.id)];
+        if (quizWebKind(question.questionType.name) !== kind || knownType !== kind || question.hasAttachments) return null;
+        if (question.questionOptions.length !== options.length) return null;
+        const doc = container.ownerDocument;
+        for (let index = 0; index < options.length; index++) {
+            const option = options[index];
+            const cached = question.questionOptions[index];
+            if (!option.input || option.input.value !== cached.id || !cached.content) return null;
+            const content = quizWebHtmlContent(cached.content, doc);
+            if (JSON.stringify(zhContentIdentity(content)) !== JSON.stringify(zhContentIdentity(option))) return null;
+        }
+        const content = quizWebHtmlContent(question.name, doc);
+        if (!content.text) return null;
+        if (visibleContent.text && JSON.stringify(zhContentIdentity(visibleContent)) !== JSON.stringify(zhContentIdentity(content))) return null;
+        return { ...content, eid: question.eid };
+    }
+
+    function quizWebHasChildren(container) {
+        if (quizWebCachedEntry(container)?.hasChildren) return true;
+        const nodes = Array.from(container.querySelectorAll('.subject_node')).filter(zhVisible);
+        return nodes.length > 1 || nodes.some((node) => /^\[\s*\d+\s*\]/.test(zhText(node)));
+    }
+
+    function quizWebQuestion(container) {
+        // 编码字体与未接入的独立附件均不能当作普通文字题交给模型猜测。
+        if (IS_ZH_NEW_EXAM && webExamUsesEncodedFont) return null;
+        if (quizWebCachedEntry(container)?.hasAttachments) return null;
+        if (quizWebHasChildren(container)) return null;
+        const type = zhText(container.querySelector('.subject_type'));
+        const kind = quizWebKind(type);
+        // 类型、分值、附件和选中图标均不属于题干；封闭 Shadow DOM 为空时保持人工处理。
+        const stem = container.querySelector('.subject_describe');
+        const visibleContent = zhRichContent(stem);
+        if (!kind) return null;
+        const options = Array.from(container.querySelectorAll('.subject_node > .nodeLab')).filter(zhVisible).map((element, index) => {
+            const label = clean(zhText(element.querySelector('.mr10'))).replace(/[.．、:：\s]/g, '').toUpperCase();
+            const optionContent = zhRichContent(element.querySelector('.node_detail'));
+            return { letter: label || String.fromCharCode(65 + index), ...optionContent,
+                element, input: element.querySelector('input[type="radio"],input[type="checkbox"]'), webExam: true };
+        });
+        const fields = quizFillFields(container.querySelector('.subject_node') || container);
+        if (['填空题', '简答题'].includes(kind) ? !fields.length : options.length < 2 || options.some((option) => !option.text)) return null;
+        const anchor = container.querySelector('.subject_num [id^="anchor_"]');
+        const cachedContent = quizWebCachedQuestion(container, kind, options, visibleContent);
+        const content = visibleContent.text ? visibleContent : cachedContent;
+        if (!content?.text) return null;
+        return { kind, title: content.text, images: content.images, options, fields,
+            blanks: kind === '填空题' ? fields.length : 0, container, doc: container.ownerDocument,
+            identity: [anchor?.id || '', zhText(anchor), cachedContent?.eid || ''], webExam: true };
+    }
+
+    function quizWebSaveButton(includeHidden = false) {
+        for (const doc of courseDocuments()) {
+            for (const controls of doc.querySelectorAll('.switch-btn-box')) {
+                const button = quizFindButtonIn(controls, ['下一题', '保存'], true, includeHidden);
+                if (button) return button;
+            }
+        }
+        return null;
+    }
+
+    function quizWebSaveMessages() {
+        return courseDocuments().flatMap((doc) => Array.from(doc.querySelectorAll('.el-message,.el-message-box,.el-dialog,[role="alert"],[role="status"]')))
+            .filter((element) => zhVisible(element) && /^保存成功[！!。\s]*$/.test(zhText(element)));
+    }
+
+    function extractQuizQuestions() {
+        const questions = [];
+        for (const doc of courseDocuments()) {
+            const body = doc.body;
+            if (!body) continue;
+            for (const container of Array.from(doc.querySelectorAll('.examPaper_subject')).filter(zhVisible)) {
+                const question = quizWebQuestion(container);
+                if (question) questions.push(question);
+            }
+            for (const group of quizGroups(doc)) {
+                if (group.closest('.examPaper_subject')) continue;
+                const container = quizContainer(group);
+                if (questions.some((question) => question.container === container)) continue;
+                const options = quizOptions(group);
+                const fields = quizFillFields(container);
+                const { kind: titleKind, title, images } = quizTitle(container);
+                const kind = quizKindOf(container, titleKind, options, fields);
+                if (!kind || !title || title.length > 1000) continue;
+                if (!options.length && !fields.length) continue;
+                const blanks = kind === '填空题' ? fields.length : 0;
+                questions.push({ kind, title, images, options, fields, blanks, container, doc });
+            }
+            // 纯填空/简答题的页面没有选项分组，单独扫描输入框。
+            for (const container of quizFillContainers(doc)) {
+                if (questions.some((question) => question.container === container ||
+                    question.container.contains(container) || container.contains(question.container))) continue;
+                const fields = quizFillFields(container);
+                if (!fields.length) continue;
+                const { kind: titleKind, title, images } = quizTitle(container);
+                const kind = quizKindOf(container, titleKind, [], fields);
+                if (!kind || !title || title.length > 1000) continue;
+                const blanks = kind === '填空题' ? fields.length : 0;
+                questions.push({ kind, title, images, options: [], fields, blanks, container, doc });
+            }
+        }
+        return questions;
+    }
+
+    function quizSignature(questions) {
+        return questions.map((question) => JSON.stringify([
+            // 同内容的新题、复用节点但题号变化的新题，均须独立填写。
+            quizNodeId(question.container),
+            question.identity || [],
+            Array.from(question.container.attributes).filter((attribute) => /^(?:id|data-(?:question|id|key|index|number))/.test(attribute.name)).map((attribute) => [attribute.name, attribute.value]),
+            quizTitle(question.container).raw.match(/^\s*(?:第\s*)?\d+\s*(?:题|[.、．:：)）])/)?.[0] || '',
+            question.kind, zhContentIdentity({ text: question.title, images: question.images }),
+            question.options.map((option) => [option.letter, zhContentIdentity(option), quizNodeId(option.element), quizNodeId(option.input), option.input?.name || '']),
+            question.fields.map((field) => [quizNodeId(field), field.name || '']),
+        ])).join('|');
+    }
+
+    function quizQuestionAnswered(question) {
+        if (question.kind === '填空题' || question.kind === '简答题') return question.fields.length > 0 && question.fields.every((field) => field.isConnected && quizFieldValue(field));
+        return question.options.some((option) => quizOptionChecked(option));
+    }
+
+    // 交卷按钮定位：优先 button/.el-button/role=button，其次才容忍 div/span 的精确文案，
+    // 避免把页头“交卷时间”“提交说明”这类文字块点掉。
+    function quizButtonDisabled(button) {
+        return button.disabled || button.getAttribute('aria-disabled') === 'true' || /(?:^|\s)(?:is-disabled|disabled)(?:\s|$)/.test(String(button.className || ''));
+    }
+
+    function quizFindButtonIn(scope, labels, includeDisabled = false, includeHidden = false) {
+        const strict = Array.from(scope.querySelectorAll('button,a,[role="button"],input[type="button"],input[type="submit"],.el-button'))
+            .filter((element) => (includeHidden || zhVisible(element)) && (includeDisabled || !quizButtonDisabled(element)));
+        const loose = Array.from(scope.querySelectorAll('div,span,li'))
+            .filter((element) => (includeHidden || zhVisible(element)) && (includeDisabled || !quizButtonDisabled(element)));
+        const textOf = (element) => clean(element.value || zhText(element));
+        for (const label of labels) {
+            const exact = strict.find((element) => textOf(element) === label) || loose.find((element) => textOf(element) === label);
+            if (exact) return exact;
+        }
+        for (const label of labels) {
+            if (label.length < 3) continue; // 过短的“提交”等只允许精确匹配
+            const partial = strict.find((element) => textOf(element).includes(label) && textOf(element).length <= label.length + 8);
+            if (partial) return partial;
+        }
+        return null;
+    }
+
+    function quizFindButton(labels, includeDisabled = false, includeHidden = false) {
+        for (const doc of courseDocuments()) {
+            const button = quizFindButtonIn(doc, labels, includeDisabled, includeHidden);
+            if (button) return button;
+        }
+        return null;
+    }
+
+    function quizNextButton(includeDisabled = false, includeHidden = false) {
+        return quizFindButton(QUIZ_NEXT_LABELS, includeDisabled, includeHidden);
+    }
+
+    function quizDialogs() {
+        const dialogs = [];
+        for (const doc of courseDocuments()) {
+            const found = doc.querySelectorAll('.el-message-box,.el-dialog,[role="dialog"],[role="alertdialog"],.layui-layer-dialog');
+            for (const element of found) if (zhVisible(element) && clean(zhText(element))) dialogs.push(element);
+        }
+        return dialogs;
+    }
+
+    function quizBlockingReason() {
+        for (const doc of courseDocuments()) {
+            if (/检测到异常脚本/.test(clean(zhText(doc.body)))) return '检测到异常脚本提示，请停用脚本后重新进入考试页';
+            const captcha = Array.from(doc.querySelectorAll('iframe[src*="captcha"],iframe[id^="tcaptcha_"],iframe#tcaptcha_iframe_dy'));
+            if (captcha.some(zhCaptchaVisible)) return '请在网页上完成人工验证';
+        }
+        return '';
+    }
+
+    function quizCancelled() {
+        const error = new Error('题目上下文已变化，已取消本轮操作');
+        error.code = 'QUIZ_CANCELLED';
+        return error;
+    }
+
+    function quizAssertCurrent(isCurrent) {
+        if (!isCurrent()) throw quizCancelled();
+    }
+
+    async function quizSetValue(field, value, isCurrent) {
+        quizAssertCurrent(isCurrent);
+        const view = field.ownerDocument.defaultView || window;
+        // 新考试页在 focus 记录旧值、blur 构造待保存答案，仅改 value 不会保存。
+        field.focus?.({ preventScroll: true });
+        quizAssertCurrent(isCurrent);
+        if (quizIsEditable(field)) {
+            field.textContent = value;
+            quizAssertCurrent(isCurrent);
+            field.dispatchEvent(new view.Event('input', { bubbles: true }));
+            quizAssertCurrent(isCurrent);
+            field.dispatchEvent(new view.Event('change', { bubbles: true }));
+            quizAssertCurrent(isCurrent);
+            field.blur?.();
+            quizAssertCurrent(isCurrent);
+            return quizFieldValue(field) === clean(value);
+        }
+        const proto = field.tagName === 'TEXTAREA' ? view.HTMLTextAreaElement.prototype : view.HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) setter.call(field, value);
+        else field.value = value;
+        quizAssertCurrent(isCurrent);
+        field.dispatchEvent(new view.Event('input', { bubbles: true }));
+        quizAssertCurrent(isCurrent);
+        field.dispatchEvent(new view.Event('change', { bubbles: true }));
+        quizAssertCurrent(isCurrent);
+        field.blur?.();
+        quizAssertCurrent(isCurrent);
+        return field.value === value;
+    }
+
+    async function quizToggleOption(option, shouldCheck, number, isCurrent) {
+        quizAssertCurrent(isCurrent);
+        if (!option.element.isConnected) throw new Error(`第 ${number} 题选项已变化，已停止作答`);
+        option.element.scrollIntoView?.({ block: 'center' });
+        quizAssertCurrent(isCurrent);
+        option.element.click();
+        quizAssertCurrent(isCurrent);
+        const applied = await waitFor(() => {
+            quizAssertCurrent(isCurrent);
+            return quizOptionChecked(option) === shouldCheck;
+        }, 700, 40);
+        quizAssertCurrent(isCurrent);
+        if (applied) return;
+        if (option.webExam) throw new Error(`第 ${number} 题 ${option.letter} 选项未确认更新，请手动核对`);
+        // Element UI 的 label 点击在部分环境不触发 input；再直接点 input 一次。
+        option.input?.click?.();
+        quizAssertCurrent(isCurrent);
+        const ok = await waitFor(() => {
+            quizAssertCurrent(isCurrent);
+            return quizOptionChecked(option) === shouldCheck;
+        }, 700, 40);
+        quizAssertCurrent(isCurrent);
+        if (!ok) throw new Error(`第 ${number} 题 ${option.letter} 选项未${shouldCheck ? '选中' : '取消选中'}，已停止作答`);
+    }
+
+    async function quizApplyQuestion(question, value, number, isCurrent) {
+        quizAssertCurrent(isCurrent);
+        if (question.kind === '填空题' || question.kind === '简答题') {
+            const fields = question.fields.filter((field) => field.isConnected);
+            if (!fields.length) throw new Error(`第 ${number} 题没有可填写的输入框，已停止作答`);
+            const texts = Array.isArray(value) ? value : [value];
+            if (question.kind === '简答题') {
+                if (!await quizSetValue(fields[0], String(texts[0] || ''), isCurrent)) throw new Error(`第 ${number} 题简答内容未写入，已停止作答`);
+                quizAssertCurrent(isCurrent);
+                return;
+            }
+            if (texts.length !== fields.length) {
+                throw new Error(`第 ${number} 题有 ${fields.length} 个空，AI 返回 ${texts.length} 段答案，已停止填写`);
+            }
+            for (let index = 0; index < fields.length; index++) {
+                quizAssertCurrent(isCurrent);
+                if (!await quizSetValue(fields[index], String(texts[index] || ''), isCurrent)) {
+                    throw new Error(`第 ${number} 题第 ${index + 1} 空未写入，已停止作答`);
+                }
+                quizAssertCurrent(isCurrent);
+            }
+            return;
+        }
+        const desired = new Set((Array.isArray(value) ? value : []).map((letter) => clean(letter).toUpperCase()));
+        if (question.kind === '多选题') {
+            for (const option of question.options) {
+                quizAssertCurrent(isCurrent);
+                if (desired.has(option.letter) || !quizOptionChecked(option)) continue;
+                await quizToggleOption(option, false, number, isCurrent);
+                quizAssertCurrent(isCurrent);
+            }
+        }
+        for (const option of question.options) {
+            quizAssertCurrent(isCurrent);
+            if (!desired.has(option.letter) || quizOptionChecked(option)) continue;
+            await quizToggleOption(option, true, number, isCurrent);
+            quizAssertCurrent(isCurrent);
+        }
+    }
+
+    async function quizApplyAnswers(questions, answers, isCurrent = () => true) {
+        for (let index = 0; index < questions.length; index++) {
+            quizAssertCurrent(isCurrent);
+            const answer = answers.get(index + 1);
+            if (!answer) throw new Error(`第 ${index + 1} 题没有可用答案，已停止作答`);
+            await quizApplyQuestion(questions[index], answer, index + 1, isCurrent);
+            quizAssertCurrent(isCurrent);
+        }
+    }
+
+    async function quizSubmitPaper(questions, isCurrent, onSubmit) {
+        quizAssertCurrent(isCurrent);
+        const unanswered = questions.filter((question) => !quizQuestionAnswered(question));
+        if (unanswered.length) throw new Error(`还有 ${unanswered.length} 道题未确认作答，已取消交卷`);
+        const button = quizFindButton(QUIZ_SUBMIT_LABELS);
+        if (!button) throw new Error('未找到交卷/提交按钮，请手动交卷');
+        const label = clean(button.value || zhText(button));
+        log('info', `点击“${label}”，等待平台确认窗口`);
+        setActivity('正在交卷…');
+        button.scrollIntoView?.({ block: 'center' });
+        quizAssertCurrent(isCurrent);
+        onSubmit();
+        button.click();
+        quizAssertCurrent(isCurrent);
+        for (let attempt = 0; attempt < 48; attempt++) {
+            await sleep(250);
+            quizAssertCurrent(isCurrent);
+            if (quizHasSubmitted()) return;
+            const dialog = quizDialogs().find((element) => /交卷|提交|确认|确定/.test(clean(zhText(element))));
+            if (!dialog) continue;
+            const message = clean(zhText(dialog));
+            if (/未作答|未答|还有\s*\d+\s*(?:道)?题|请完成|不能交卷|不可交卷/.test(message)) {
+                throw new Error(`平台未允许交卷：${truncate(message, 80)}`);
+            }
+            const confirm = quizFindButtonIn(dialog, ['确认交卷', '确定交卷', '确定', '确认', '提交', '交卷']);
+            if (!confirm) throw new Error('交卷确认窗口未找到确认按钮，请手动交卷');
+            log('info', `确认交卷：${truncate(message, 40)}`);
+            quizAssertCurrent(isCurrent);
+            confirm.click();
+            quizAssertCurrent(isCurrent);
+            return;
+        }
+        log('warn', '未检测到交卷确认窗口，可能已直接提交，请核对页面');
+    }
+
+    // 交卷成功必须有正向证据（成功文案/结果页），不能用“题目消失”反证，
+    // 也不能裸匹配“已提交”，否则说明文字或加载遮罩都会被误判成已交卷。
+    const QUIZ_SUCCESS_PATTERN = /^(?:已交卷|交卷成功|提交成功|作业已提交|提交完成|试卷已提交|考试已结束|提交试卷成功|您的成绩|得分\s*[:：])(?:\s|[，,。.!！:：]|$|\d)/;
+
+    function quizHasSubmitted(questions = extractQuizQuestions()) {
+        const questionRoots = questions.map((question) => question.container);
+        for (const doc of courseDocuments()) {
+            for (const element of doc.querySelectorAll('body *')) {
+                if (!zhVisible(element) || element.closest('#xt-ds-host,script,style,.question-item,.q-title,.el-radio,.el-checkbox,input,textarea,[contenteditable]')) continue;
+                if (questionRoots.some((root) => root.contains(element) || element.contains(root))) continue;
+                // 只读当前可见的实际结果文本；题干、隐藏模板和页面说明不作为交卷证据。
+                const ownText = clean(Array.from(element.childNodes).filter((node) => node.nodeType === 3).map((node) => node.nodeValue).join(' '));
+                if (QUIZ_SUCCESS_PATTERN.test(ownText)) return true;
+            }
+        }
+        return false;
+    }
+
+    function quizLastPageKnown(questions) {
+        for (const doc of courseDocuments()) {
+            for (const element of doc.querySelectorAll('body *')) {
+                if (!zhVisible(element) || questions.some((question) => question.container.contains(element) || element.contains(question.container))) continue;
+                const text = clean(Array.from(element.childNodes).filter((node) => node.nodeType === 3).map((node) => node.nodeValue).join(' '));
+                if (/^(?:已到|当前为)?最后(?:一|1)(?:题|页)[。！!]?$|^(?:题目)?(?:已全部作答|全部已作答|所有题目已作答)[。！!]?$/.test(text)) return true;
+                const count = text.match(/^(?:(?:已答|已作答|第)\s*)?(\d+)\s*(?:题|页)?\s*(?:\/|共)\s*(\d+)\s*(?:题|页)?$/);
+                if (count && Number(count[1]) > 0 && Number(count[1]) === Number(count[2])) return true;
+            }
+        }
+        return false;
+    }
+
+    async function quizWaitSubmitted(isCurrent) {
+        for (let attempt = 0; attempt < 60; attempt++) {
+            quizAssertCurrent(isCurrent);
+            if (quizHasSubmitted()) return true;
+            await sleep(500);
+            quizAssertCurrent(isCurrent);
+        }
+        return false;
+    }
+
+    function createZhihuishuQuiz() {
+        const app = {
+            _cellData: null,
+            _destroyed: true,
+            _timer: null,
+            _busy: false,
+            _answered: new Set(),
+            _submitted: false,
+            _diagLogged: false,
+            _quizProgress: null,
+            _failures: new Map(),
+            _fatal: false,
+            _activeSignature: '',
+            _advanceGuard: { signature: '' },
+            _endCandidate: null,
+            _hasPagination: false,
+            _webSaveAttempts: new Map(),
+            _token: null,
+            _attemptedSubmissions: new Set(),
+            _blockedText: '',
+            _doneLogged: false,
+            _stepTitle: '作业/考试',
+            _currentStepTitle() {
+                return this._stepTitle || '作业/考试';
+            },
+            _answerCount() {
+                return this._answered.size;
+            },
+            inspectQuiz() {
+                return extractQuizQuestions().map((question, index) => ({
+                    id: index + 1,
+                    type: question.kind,
+                    question: question.title,
+                    options: question.options.map((option) => `${option.letter}. ${option.text}`),
+                    imageCount: question.images.length + question.options.reduce((sum, option) => sum + option.images.length, 0),
+                }));
+            },
+            destroy() {
+                this._destroyed = true;
+                this.cancelQuizContext();
+                if (this._timer) clearInterval(this._timer);
+                this._timer = null;
+            },
+            nextUnit() {
+                const next = quizNextButton();
+                if (!next) {
+                    log('warn', '未找到“下一题”，当前页就是最后一页');
+                    return;
+                }
+                log('info', '手动请求：点击“下一题”');
+                next.click();
+            },
+            run() {
+                this._destroyed = false;
+                log('success', `=== ${PLATFORM_NAME}适配已启动 ===`);
+                log('info', `页面：${location.hostname}${location.pathname}`);
+                log('info', `自动答题${settings.autoQuiz ? '已开启' : '已关闭'}，自动交卷${settings.autoSubmit ? '已开启' : '已关闭'}`);
+                this._timer = setInterval(() => this._tick(), 1200);
+                this._tick();
+            },
+            _tick() {
+                if (this._destroyed || this._submitted || this._fatal) return;
+                // 请求尚未返回时也监测验证码/换题；撤销过的 token 不能恢复有效。
+                if (this._token) this._contextIsCurrent(this._token);
+                if (this._busy) return;
+                this._work().catch((error) => {
+                    if (this._destroyed || error.code === 'QUIZ_CANCELLED') return;
+                    const signature = this._activeSignature;
+                    const failures = signature ? (this._failures.get(signature) || 0) + 1 : 1;
+                    if (signature) this._failures.set(signature, failures);
+                    const message = error.message || String(error);
+                    log('error', `作业/考试自动作答停止：${message}`);
+                    setActivity('已停止：' + message);
+                    setMode('error');
+                    // 交卷失败不再重试（避免重复交卷）；同一页连续失败 3 次也停止。
+                    if (this._fatal || failures >= 3) {
+                        this._fatal = true;
+                        if (this._timer) clearInterval(this._timer);
+                        this._timer = null;
+                        log('warn', '已停止自动作答，请人工核对页面后手动处理');
+                    }
+                });
+            },
+            cancelQuizContext() {
+                if (this._token) this._token.valid = false;
+                this._token = null;
+            },
+            _contextIsCurrent(token) {
+                if (!token?.valid) return false;
+                const blocked = quizBlockingReason();
+                const valid = !this._destroyed && state.app === this && this._token === token &&
+                    settings.autoQuiz && currentApiKey() === token.key && !blocked &&
+                    (token.phase !== 'submit' || settings.autoSubmit) &&
+                    ((token.phase === 'submit' && quizHasSubmitted()) || quizSignature(extractQuizQuestions()) === token.signature);
+                if (!valid) {
+                    token.valid = false;
+                    if (this._token === token) this._token = null;
+                    if (blocked) setActivity(blocked);
+                }
+                return valid;
+            },
+            async _work() {
+                this._busy = true;
+                try {
+                    const blocked = quizBlockingReason();
+                    if (blocked) {
+                        this.cancelQuizContext();
+                        setActivity(blocked);
+                        if (this._blockedText !== blocked) {
+                            this._blockedText = blocked;
+                            log('warn', blocked);
+                        }
+                        return;
+                    }
+                    this._blockedText = '';
+                    if (!settings.autoQuiz) {
+                        this.cancelQuizContext();
+                        setActivity('自动答题已关闭，请手动作答');
+                        return;
+                    }
+                    const questions = extractQuizQuestions();
+                    if (quizHasSubmitted(questions)) {
+                        this._submitted = true;
+                        this._stepTitle = '已交卷';
+                        setActivity('已交卷');
+                        log('success', '检测到已交卷/提交成功，停止自动化');
+                        return;
+                    }
+                    const unreadable = quizWebRoots().some((container) => !quizWebQuestion(container));
+                    if (unreadable) {
+                        this.cancelQuizContext();
+                        setActivity(webExamUsesEncodedFont ? '题目使用编码字体，尚未解码，请人工处理' :
+                            quizWebRoots().some(quizWebHasChildren) ? '当前题包含子题，复杂题结构需人工处理' :
+                            quizWebRoots().some((container) => quizWebCachedEntry(container)?.hasAttachments) ? '题目包含独立附件，当前无法完整读取，请手动处理' :
+                            '题干或选项不可读取，请刷新页面后重试；仍不可读时请手动处理');
+                        if (!this._diagLogged) {
+                            this._diagLogged = true;
+                            log('warn', '已发现新版考试题块，但无法完整读取题干或选项；已暂停自动作答，请手动处理');
+                        }
+                        return;
+                    }
+                    if (!questions.length) {
+                        if (!this._diagLogged) {
+                            this._diagLogged = true;
+                            const inputs = document.querySelectorAll('input[type="radio"],input[type="checkbox"]').length;
+                            const blanks = Array.from(document.querySelectorAll('textarea,input,[contenteditable="true"]')).filter(quizIsFillField).length;
+                            log('info', `暂未识别到题目；页面选项 input ${inputs} 个、文本框 ${blanks} 个，继续等待渲染（若长时间为空请点“识别题目”并反馈页面地址）`);
+                        }
+                        setActivity('等待题目加载…');
+                        return;
+                    }
+                    this._diagLogged = false;
+                    this._quizProgress = { pages: this._answered.size, total: questions.length, filled: false };
+                    if (!currentApiKey()) {
+                        setActivity('未填写 DeepSeek API Key');
+                        return;
+                    }
+                    const signature = quizSignature(questions);
+                    if (signature !== this._activeSignature) {
+                        this._advanceGuard = { signature: '' };
+                        this._endCandidate = null;
+                        this._doneLogged = false;
+                    }
+                    this._activeSignature = signature;
+                    const token = { valid: true, signature, key: currentApiKey(), phase: 'answer' };
+                    this._token = token;
+                    const isCurrent = () => this._contextIsCurrent(token);
+                    if (this._answered.has(signature)) {
+                        if (questions.every(quizQuestionAnswered)) {
+                            await this._advance(questions, token);
+                            return;
+                        }
+                        this._answered.delete(signature);
+                    }
+                    if (questions.some((question) => !['填空题', '简答题'].includes(question.kind) &&
+                        (question.options.length < 2 || question.options.length > 8 || new Set(question.options.map((option) => option.letter)).size !== question.options.length))) {
+                        throw new Error('题目选项不完整或字母重复，请手动核对');
+                    }
+                    log('info', `识别到 ${questions.length} 道题：${questions.map((question) => question.kind).join('、')}`);
+                    for (let index = 0; index < questions.length; index++) {
+                        log('info', `${index + 1}. [${questions[index].kind}] ${truncate(questions[index].title, 40)}`);
+                    }
+                    setActivity(`识别到 ${questions.length} 道题，等待 DeepSeek 作答…`);
+                    // 整页试卷分批请求，避免超过图文 24 图和输出长度限制。
+                    const answers = new Map();
+                    let offset = 0;
+                    while (offset < questions.length) {
+                        quizAssertCurrent(isCurrent);
+                        const batch = [];
+                        let images = 0;
+                        while (offset + batch.length < questions.length && batch.length < 8) {
+                            const question = questions[offset + batch.length];
+                            const count = question.images.length + question.options.reduce((sum, option) => sum + option.images.length, 0);
+                            if (count > 24) throw new Error('单道题目的图片超过 24 张，请手动作答');
+                            if (batch.length && images + count > 24) break;
+                            images += count;
+                            batch.push(question);
+                        }
+                        let result;
+                        try {
+                            result = await askAnswers(batch, isCurrent);
+                        } catch (error) {
+                            // 公共请求函数保留共享课原语义；考试取消统一标记，不能累计失败。
+                            if (!isCurrent()) throw quizCancelled();
+                            throw error;
+                        }
+                        quizAssertCurrent(isCurrent);
+                        for (let index = 0; index < batch.length; index++) answers.set(offset + index + 1, result.answers.get(index + 1));
+                        offset += batch.length;
+                    }
+                    // 等待期间页面可能翻页/刷新/换题：必须重新识别并比对签名，
+                    // 否则旧答案会按位置写进已经换掉的新题。
+                    const fresh = extractQuizQuestions();
+                    quizAssertCurrent(isCurrent);
+                    for (let index = 0; index < fresh.length; index++) {
+                        const value = answers.get(index + 1);
+                        log('info', `${index + 1}. → ${Array.isArray(value) ? value.join(' / ') : value}`);
+                    }
+                    setActivity('答案已生成，正在填写…');
+                    await quizApplyAnswers(fresh, answers, isCurrent);
+                    quizAssertCurrent(isCurrent);
+                    if (!fresh.every(quizQuestionAnswered)) throw new Error('部分题目未完整填写，已停止翻页/交卷');
+                    this._answered.add(signature);
+                    this._failures.delete(signature);
+                    this._quizProgress = { pages: this._answered.size, total: fresh.length, filled: true };
+                    log('success', `本页 ${fresh.length} 道题已作答`);
+                    await this._advance(fresh, token);
+                } finally {
+                    this._busy = false;
+                }
+            },
+            async _advance(questions, token) {
+                const isCurrent = () => this._contextIsCurrent(token);
+                quizAssertCurrent(isCurrent);
+                if (!questions.every(quizQuestionAnswered)) throw new Error('当前页仍有题目未完整填写，已停止翻页/交卷');
+                const signature = token.signature;
+                let webLastSaved = false;
+                if (questions.some((question) => question.webExam)) {
+                    const save = quizWebSaveButton(true);
+                    if (!save || !zhVisible(save) || quizButtonDisabled(save)) {
+                        setActivity('等待平台下一题/保存按钮可用…');
+                        return;
+                    }
+                    const label = clean(zhText(save));
+                    this._hasPagination = true;
+                    const attempt = this._webSaveAttempts.get(signature);
+                    if (!attempt) {
+                        const previousMessages = new Set(quizWebSaveMessages());
+                        quizAssertCurrent(isCurrent);
+                        this._webSaveAttempts.set(signature, { label, previousMessages, saved: false });
+                        log('info', `点击“${label}”，等待平台保存当前题答案`);
+                        save.click();
+                        quizAssertCurrent(isCurrent);
+                        setActivity('等待平台保存当前题答案…');
+                        return;
+                    }
+                    if (attempt.label === '下一题') {
+                        setActivity('等待平台保存并显示下一题…');
+                        return;
+                    }
+                    if (!attempt.saved && quizWebSaveMessages().some((message) => !attempt.previousMessages.has(message))) attempt.saved = true;
+                    if (!attempt.saved) {
+                        setActivity('已点击保存，等待平台“保存成功”提示，请勿重复操作');
+                        return;
+                    }
+                    webLastSaved = true;
+                    if (!settings.autoSubmit) {
+                        setActivity('当前题已保存，自动交卷未开启，请核对后手动提交');
+                        return;
+                    }
+                }
+                const next = webLastSaved ? null : quizNextButton(true, true);
+                if (next) {
+                    this._hasPagination = true;
+                    this._endCandidate = null;
+                    if (!zhVisible(next) || quizButtonDisabled(next)) {
+                        setActivity('下一题按钮暂不可用，等待页面更新…');
+                        return;
+                    }
+                    // 切题渲染完成前（签名不变）绝不再点一次“下一题”，否则会连跳题。
+                    if (this._advanceGuard.signature === signature) {
+                        setActivity('等待下一题渲染…');
+                        return;
+                    }
+                    this._advanceGuard = { signature };
+                    log('info', '当前页已完成，点击“下一题”');
+                    quizAssertCurrent(isCurrent);
+                    next.click();
+                    await sleep(900);
+                    quizAssertCurrent(isCurrent);
+                    return;
+                }
+                if (!settings.autoSubmit) {
+                    if (!this._doneLogged) {
+                        this._doneLogged = true;
+                        setActivity('已作答，未开启自动交卷，请手动交卷');
+                        log('warn', '未开启自动交卷：答案已填好，请核对后手动交卷');
+                    }
+                    return;
+                }
+                if (!quizFindButton(QUIZ_SUBMIT_LABELS)) {
+                    this._endCandidate = null;
+                    setActivity('本页已作答，等待下一题或交卷按钮…');
+                    return;
+                }
+                // 常驻交卷按钮不能证明已到末页；分页消失时还需要末页/总数证据。
+                if (this._hasPagination && !webLastSaved && !quizLastPageKnown(questions)) {
+                    this._endCandidate = null;
+                    setActivity('本页已作答，未能确认末页，请手动核对或交卷');
+                    return;
+                }
+                if (!this._endCandidate || this._endCandidate.signature !== signature) this._endCandidate = { signature, since: Date.now() };
+                if (Date.now() - this._endCandidate.since < 3600) {
+                    setActivity('等待题目与交卷按钮保持稳定…');
+                    return;
+                }
+                if (this._attemptedSubmissions.has(signature)) {
+                    setActivity('本页已尝试交卷，请在平台确认提交状态');
+                    return;
+                }
+                token.phase = 'submit';
+                try {
+                    await quizSubmitPaper(questions, isCurrent, () => this._attemptedSubmissions.add(signature));
+                    const done = await quizWaitSubmitted(isCurrent);
+                    if (!done) {
+                        log('warn', '点击交卷后 30 秒内未检测到平台成功提示');
+                        throw new Error('未确认交卷成功，已停止自动流程，请手动核对页面');
+                    }
+                } catch (error) {
+                    // 交卷失败后不再自动重试，避免重复交卷。
+                    if (error.code === 'QUIZ_CANCELLED') throw error;
+                    this._fatal = true;
+                    throw error;
+                }
+                this._submitted = true;
+                this._stepTitle = '已交卷';
+                setMode('idle');
+                setActivity('已交卷');
+                log('success', '交卷流程已完成，请到平台确认成绩/提交状态');
+                this.destroy();
             },
         };
         return app;
@@ -3015,6 +4096,9 @@
         .line.warn .m { color: #ffcf6b; }
         .line.error .m { color: #ff8f8f; }
         .foot { color: #5f6a7f; font-size: 10px; text-align: right; }
+        .quiz-only { display: none; }
+        .panel.quiz .quiz-only { display: inline-flex; align-items: center; gap: 4px; }
+        .panel.quiz .video-only { display: none !important; }
     `;
 
     const MARKUP = `
@@ -3044,8 +4128,8 @@
                 <div class="row">
                     <button class="btn primary" data-act="start">开始</button>
                     <button class="btn danger" data-act="stop">停止</button>
-                    <button class="btn" data-act="next">下一节</button>
-                    <select class="rate" id="rate" title="播放倍速（默认跟随页面）">
+                    <button class="btn video-only" data-act="next">下一节</button>
+                    <select class="rate video-only" id="rate" title="播放倍速（默认跟随页面）">
                         <option value="0">跟随页面</option>
                         <option value="1">1.0x</option>
                         <option value="1.25">1.25x</option>
@@ -3055,18 +4139,19 @@
                         <option value="2.5">2.5x</option>
                         <option value="3">3.0x</option>
                     </select>
-                    <label class="lock" title="拦截页面把倍速改回 1x"><input type="checkbox" id="lock-rate"> 锁定</label>
+                    <label class="lock video-only" title="拦截页面把倍速改回 1x"><input type="checkbox" id="lock-rate"> 锁定</label>
                 </div>
                 <div class="row toggles">
                     <label><input type="checkbox" id="auto-quiz"> 自动答题</label>
-                    <label><input type="checkbox" id="auto-next"> 自动跳节</label>
+                    <label class="video-only"><input type="checkbox" id="auto-next"> 自动跳节</label>
+                    <label class="quiz-only" title="答完全部题目后自动点交卷并确认"><input type="checkbox" id="auto-submit"> 自动交卷</label>
                     <span class="spacer"></span>
                     <button class="btn tiny" data-act="inspect">识别题目</button>
-                    <button class="btn tiny" data-act="diagnose">字体诊断</button>
+                    <button class="btn tiny video-only" data-act="diagnose">字体诊断</button>
                     <button class="btn tiny" data-act="clear">清空日志</button>
                 </div>
                 <div class="log" id="log"></div>
-                <div class="foot"><span id="rate-actual">实际 —</span> · deepseek-flash · 低强度思考 · 8000 tokens</div>
+                <div class="foot"><span class="video-only" id="rate-actual">实际 —</span><span class="quiz-only">作业/考试页 · </span> deepseek-flash · 低强度思考 · 8000 tokens</div>
             </div>
         </div>
     `;
@@ -3145,6 +4230,7 @@
             keyEl: shadow.getElementById('key'),
             autoQuizEl: shadow.getElementById('auto-quiz'),
             autoNextEl: shadow.getElementById('auto-next'),
+            autoSubmitEl: shadow.getElementById('auto-submit'),
             rateEl: shadow.getElementById('rate'),
             rateActualEl: shadow.getElementById('rate-actual'),
             lockEl: shadow.getElementById('lock-rate'),
@@ -3154,14 +4240,20 @@
         ui.keyEl.value = settings.apiKey;
         ui.autoQuizEl.checked = settings.autoQuiz;
         ui.autoNextEl.checked = settings.autoNext;
+        if (ui.autoSubmitEl) ui.autoSubmitEl.checked = settings.autoSubmit;
+        // 作业/考试页隐藏视频控件（倍速、跳节、字体诊断），显示交卷开关。
+        if (IS_ZH_QUIZ) panelEl.classList.add('quiz');
         if (IS_ZHIHUI) {
-            const limit = document.createElement('option');
-            limit.value = '1.8';
-            limit.textContent = '1.8x';
-            const firstUnsupported = Array.from(ui.rateEl.options).find(option => Number(option.value) > 1.8);
-            ui.rateEl.insertBefore(limit, firstUnsupported || null);
-            Array.from(ui.rateEl.options).forEach(option => { if (Number(option.value) > 1.8) option.disabled = true; });
-            settings.rate = Math.min(1.8, settings.rate);
+            const pageRate = document.createElement('option');
+            pageRate.value = '1.8';
+            pageRate.textContent = '1.8x';
+            const nextHigherRate = Array.from(ui.rateEl.options).find(option => Number(option.value) > 1.8);
+            ui.rateEl.insertBefore(pageRate, nextHigherRate || null);
+            Array.from(ui.rateEl.options).forEach(option => { if (Number(option.value) > ZHIHUI_RATE_LIMIT) option.disabled = true; });
+            if (settings.rate > ZHIHUI_RATE_LIMIT) {
+                settings.rate = ZHIHUI_RATE_LIMIT;
+                storage.set('rate', settings.rate);
+            }
         }
         ui.rateEl.value = String(settings.rate || 0);
         ui.lockEl.checked = settings.lockRate;
@@ -3201,8 +4293,13 @@
             storage.set('autoNext', settings.autoNext);
             log('info', `自动跳节已${settings.autoNext ? '开启' : '关闭'}`);
         });
+        ui.autoSubmitEl?.addEventListener('change', () => {
+            settings.autoSubmit = ui.autoSubmitEl.checked;
+            storage.set('autoSubmit', settings.autoSubmit);
+            log('info', `自动交卷已${settings.autoSubmit ? '开启' : '关闭'}`);
+        });
         ui.rateEl.addEventListener('change', () => {
-            const rate = IS_ZHIHUI ? Math.min(1.8, Number(ui.rateEl.value) || 0) : Number(ui.rateEl.value) || 0;
+            const rate = IS_ZHIHUI ? Math.min(ZHIHUI_RATE_LIMIT, Number(ui.rateEl.value) || 0) : Number(ui.rateEl.value) || 0;
             ui.rateEl.value = String(rate);
             settings.rate = rate;
             storage.set('rate', rate);
@@ -3354,7 +4451,7 @@
     }
 
     function applyRateToCurrent() {
-        if (!state.app) return;
+        if (!state.app || state.scriptWarning) return;
         let video = null;
         try {
             video = state.app._videoEl || (typeof state.app._getVideoEl === 'function' ? state.app._getVideoEl() : null);
@@ -3374,7 +4471,52 @@
         }
     }
 
+    function stopForScriptWarning(message) {
+        const video = state.app?._videoEl;
+        state.scriptWarning = message;
+        settings.rate = 0;
+        settings.lockRate = false;
+        storage.set('rate', 0);
+        storage.set('lockRate', false);
+        ui.rateEl.value = '0';
+        ui.rateEl.disabled = true;
+        ui.lockEl.checked = false;
+        ui.lockEl.disabled = true;
+        if (video) {
+            // 释放本脚本的控制；保留平台警告，交由用户停用插件并重新进入。
+            unlockRateLock(video);
+            video.__xtRateTarget = 0;
+            try {
+                video.defaultPlaybackRate = 1;
+                video.playbackRate = 1;
+                if (!video.paused) video.pause();
+            } catch (error) {
+                /* 页面已销毁播放器时仍继续清理自动化。 */
+            }
+        }
+        stopAutomation('异常脚本提示');
+        setMode('error');
+        setActivity(message);
+        log('warn', message);
+    }
+
     function startAutomation() {
+        if (IS_ZHIHUI) {
+            const blocked = state.scriptWarning || zhBlockingReason();
+            if (blocked.startsWith('检测到异常脚本')) {
+                stopForScriptWarning(blocked);
+                return;
+            }
+        }
+        if (IS_ZH_QUIZ) {
+            const blocked = state.scriptWarning || quizBlockingReason();
+            if (blocked) {
+                setMode('error');
+                setActivity(blocked);
+                log('warn', blocked);
+                return;
+            }
+        }
         const typedKey = String(ui.keyEl?.value || '').trim();
         if (typedKey !== settings.apiKey) {
             settings.apiKey = typedKey;
@@ -3388,14 +4530,14 @@
             }
         }
         state.app = null;
-        if (!IS_ZHIHUI && (!getJQuery() || !getJQuery().fn)) {
+        if (!IS_ZHIHUI && !IS_ZH_QUIZ && (!getJQuery() || !getJQuery().fn)) {
             log('error', '页面尚未加载 jQuery，请稍后重试');
             return;
         }
         setMode('running');
         setActivity('正在启动自动化…');
         try {
-            const app = IS_ZHIHUI ? createZhihuishuPlayer() : createPlayer();
+            const app = IS_ZHIHUI ? createZhihuishuPlayer() : IS_ZH_QUIZ ? createZhihuishuQuiz() : createPlayer();
             state.app = app;
             app.run();
             if (typeof app._bindPageGuards === 'function') app._bindPageGuards();
@@ -3433,7 +4575,7 @@
             return;
         }
         state.app.nextUnit();
-        setActivity('已请求切换下一节');
+        setActivity(IS_ZH_QUIZ ? '已请求切换下一题' : '已请求切换下一节');
     }
 
     function inspectQuestions() {
@@ -3452,7 +4594,7 @@
             log('warn', '当前页面没有识别到题目（可能尚未进入章节测验）');
             return;
         }
-        if (!IS_ZHIHUI) log('info', '注意：学习通可能用字体反爬替换页面文字，以下是页面原文；作答时模型会先还原');
+        if (!IS_ZHIHUI && !IS_ZH_QUIZ) log('info', '注意：学习通可能用字体反爬替换页面文字，以下是页面原文；作答时模型会先还原');
         log('info', `识别到 ${list.length} 道题：`);
         for (const item of list) {
             log('info', `${item.id}. [${item.type}] ${truncate(item.question, 40)}｜选项 ${item.options.length} 个${item.imageCount ? `｜图片 ${item.imageCount} 张（图文识别）` : ''}`);
@@ -3550,6 +4692,14 @@
                     : state.mode === 'waiting' ? '等待页面' : '未开始';
         }
         setText(ui.stepEl, step);
+
+        if (IS_ZH_QUIZ) {
+            const progress = app?._quizProgress || null;
+            setText(ui.chapterEl, progress ? `本页 ${progress.total} 题｜已处理 ${progress.pages} 页` : '');
+            setText(ui.timeEl, progress ? `${progress.total} 题` : '--:--');
+            if (ui.barEl) ui.barEl.style.width = progress ? (progress.filled ? '100%' : '20%') : '0%';
+            return;
+        }
 
         let chapter = '';
         if (app && app._cellData) {
@@ -3667,6 +4817,13 @@
             startAutomation();
             return;
         }
+        if (IS_ZH_QUIZ) {
+            // 作业/考试页由 Element UI 渲染题目，不依赖 jQuery 和课程目录，
+            // 直接启动轮询，等待题目渲染后再识别。
+            if (!settings.apiKey) log('warn', '尚未保存 API Key：识别到题目后需要 Key 才能作答');
+            startAutomation();
+            return;
+        }
         setMode('waiting');
         setActivity('正在等待学习通课程页…');
         try {
@@ -3695,7 +4852,7 @@
     mount();
     registerMenus();
     installHotkey();
-    if (!IS_ZHIHUI) relaxNativeConfirm();
+    if (!IS_ZHIHUI && !IS_ZH_QUIZ) relaxNativeConfirm();
     log('info', `面板已加载 v${VERSION}`);
     if (settings.apiKey) log('info', '已读取本机保存的 API Key');
     setInterval(renderStatus, 1000);
@@ -3713,5 +4870,20 @@
         };
     } catch (error) {
         /* 某些页面禁用 window 扩展时忽略 */
+    }
+    }
+
+    if (document.body) initialize();
+    else {
+        // 兼容 head 阶段注入；只启动一次，随后移除监听，避免多份面板和定时器。
+        const ready = () => {
+            if (!document.body) return;
+            initialize();
+            document.removeEventListener('DOMContentLoaded', ready);
+            observer.disconnect();
+        };
+        const observer = new MutationObserver(ready);
+        observer.observe(document.documentElement || document, { childList: true, subtree: true });
+        document.addEventListener('DOMContentLoaded', ready, { once: true });
     }
 })();
